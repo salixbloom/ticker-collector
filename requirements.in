@@ -1,0 +1,6 @@
+# Direct runtime dependencies, loose. The pinned, fully-resolved set lives in
+# requirements.txt, which is what the image installs; regenerate it with
+# `make lock` after changing this file.
+pyarrow>=18,<22
+httpx>=0.27,<1
+pandas_market_calendars>=4.4,<6

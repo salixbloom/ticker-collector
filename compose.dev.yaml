@@ -1,0 +1,20 @@
+# Development only: the test runner. Not used in deployment.
+#
+#   docker compose -f compose.dev.yaml run --rm tests
+#
+# `make test` does the same thing without needing compose.
+
+services:
+  tests:
+    build:
+      context: .
+      target: dev
+    image: tick-collector-dev:latest
+    environment:
+      # Tests write only to a throwaway directory inside the container.
+      COLLECTOR_DATA_ROOT: /tmp/collector-data
+    volumes:
+      - ./src:/app/src:ro
+      - ./tests:/app/tests:ro
+      - ./config:/app/config:ro
+    command: ["python", "-m", "pytest"]

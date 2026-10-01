@@ -1,0 +1,81 @@
+# tick-collector — Dockge / Unraid stack
+#
+# Dockge keeps each stack in its own directory (usually
+# /mnt/user/appdata/dockge/stacks/<name>) and manages `compose.yaml` plus `.env`
+# there. Put this repository in that directory, set the values in `.env`, and hit
+# Deploy — Compose builds the image on first start, so there is no registry to
+# push to and nothing to pull.
+#
+# Everything an operator needs to change lives in `.env`, which Dockge gives you
+# an editor for. Nothing in this file should need editing.
+#
+# See DEPLOY.md for the walkthrough.
+
+services:
+  collector:
+    build:
+      context: .
+      target: app
+      args:
+        # Must match the owner of the data share below. Unraid's shares are
+        # nobody:users = 99:100, which is the default.
+        APP_UID: ${APP_UID:-99}
+        APP_GID: ${APP_GID:-100}
+    image: tick-collector:${COLLECTOR_VERSION:-0.1.0}
+    container_name: tick-collector
+    restart: unless-stopped
+
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Only affects log timestamps; the scheduler's own timezone comes from
+      # config/collector.toml so the two cannot drift apart.
+      TZ: ${TZ:-America/New_York}
+      COLLECTOR_LOG_LEVEL: ${COLLECTOR_LOG_LEVEL:-INFO}
+      COLLECTOR_DATA_ROOT: /data
+      COLLECTOR_CONFIG: /app/config/collector.toml
+
+    volumes:
+      # Bulk data on the array. published/, staging/, quarantine/, state/, work/
+      # and logs/ all live under here; they must stay on ONE filesystem or the
+      # atomic publish stops being atomic, which `collector init` refuses to start
+      # without.
+      - ${COLLECTOR_DATA_DIR:-/mnt/user/quant-data}:/data
+      # Thresholds, universe size, extended hours, compression level. Read-only:
+      # the collector never writes its own config.
+      - ./config:/app/config:ro
+      # Backups. Uncomment, and set [backup] directory = "/backups" in
+      # config/collector.toml, to enable the nightly backup job. Use a different
+      # share from the data above -- a backup on the same disk is not a backup.
+      # - ${COLLECTOR_BACKUP_DIR:-/mnt/user/backups/tick-collector}:/backups
+
+    # Minute-day batches are small; this is ample and keeps a runaway job from
+    # pressuring the rest of the server.
+    mem_limit: ${COLLECTOR_MEM_LIMIT:-2g}
+    # The scheduler stops cleanly on SIGTERM, finishing the batch in flight
+    # rather than leaving a partial file behind.
+    stop_grace_period: 60s
+
+    # Unhealthy when status.json is stale or the last run hard-failed. Dockge
+    # shows this in the stack list, so a silent failure becomes visible without
+    # reading logs. start-period is generous because the startup catch-up pass
+    # begins collecting straight away.
+    healthcheck:
+      test: ["CMD", "python", "-m", "collector", "healthcheck"]
+      interval: 5m
+      timeout: 30s
+      start_period: 5m
+      retries: 3
+
+    # Dockge reads container logs from the json-file driver, so keep them bounded
+    # — the Unraid cache drive fills otherwise.
+    logging:
+      driver: json-file
+      options:
+        max-size: ${COLLECTOR_LOG_MAX_SIZE:-16m}
+        max-file: ${COLLECTOR_LOG_MAX_FILE:-5}
+
+    labels:
+      org.opencontainers.image.title: tick-collector
+      org.opencontainers.image.description: Self-healing US equity market data collector

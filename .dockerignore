@@ -1,0 +1,16 @@
+.git/
+.gitignore
+.agent/
+data/
+.env
+*.env
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.md
+!README.md

@@ -1,0 +1,86 @@
+# Collector configuration. Mounted into the container at /app/config/collector.toml.
+# Secrets never live here -- they come from the environment (see .env.example).
+
+[paths]
+data_root = "/data"
+
+[storage]
+# Parquet zstd level. M7 benchmarks 3 / 9 / 15 on a month of minute data and
+# records the size/speed tradeoff in the decision log; 9 is the starting point.
+compression_level = 9
+# Target uncompressed row group size, bytes (~128 MB per the plan).
+row_group_bytes = 134217728
+
+[source]
+base_url = "https://api.massive.com"
+# Free plan: 5 calls per minute, shared by every job in this process.
+calls_per_minute = 5
+max_retries = 5
+timeout_seconds = 30
+
+[universe]
+# Minute-bar universe size (top N by trailing 20-day dollar volume).
+size = 1000
+# Keep collecting a ticker for this long after it drops out of the universe.
+grace_days = 30
+# Instrument types to include, matched against the `type` column of the reference
+# snapshot. Empty means no filter, which is what the raw ranking gives: measured
+# on real data, SPY ($36bn/day) and QQQ ($26bn/day) outrank every actual stock, so
+# ETFs will occupy a share of the most liquid slots. Set types = ["CS"] for common
+# stock only, or e.g. ["CS", "ETF"] to be explicit about allowing both.
+types = []
+
+[collection]
+# Collect pre/post-market minute bars. Cheap to store, impossible to recover
+# after the 2-year window passes.
+extended_hours = true
+# Trading-day history to maintain (free plan ceiling is 2 years).
+backfill_days = 730
+# API calls the scheduled minute job may spend per run. A 1,000-ticker day costs
+# ~1,000 calls = ~200 minutes at 5/minute, so this allows a day plus some catch-up
+# without the run still going when tomorrow's slot arrives.
+minute_calls_per_run = 1200
+# Days per call when backfilling minute bars, which needs ~10x fewer calls than
+# fetching a day at a time. One call returns at most 50,000 bars and a dense
+# extended-hours day is ~960, so 40 days leaves headroom.
+minute_backfill_chunk_days = 40
+
+[checks]
+# EOD ticker count vs trailing 20-day median.
+eod_count_soft_tolerance = 0.10
+eod_count_hard_tolerance = 0.30
+# Stop the run if more than this share of batches fail.
+run_failure_abort_ratio = 0.20
+
+[scheduler]
+timezone = "America/New_York"
+heartbeat_seconds = 60
+# Run every job once ~2 minutes after startup instead of waiting for its slot, so
+# a fresh deployment starts collecting immediately. Safe to leave on: each job
+# only fills what the manifest says is missing, so an extra run is a no-op.
+# Note a first start therefore BEGINS THE BACKFILL; [collection] backfill_days
+# controls how big that is.
+catch_up_on_start = true
+catch_up_delay_seconds = 120
+
+[health]
+# status.json older than this is unhealthy.
+max_status_age_seconds = 93600  # 26 hours
+
+[alerts]
+# Hours before a still-active alert is re-sent. The webhook URL itself comes from
+# COLLECTOR_ALERT_WEBHOOK in the environment, because it is a secret. Without a
+# cooldown, a provider outage would post a message every heartbeat all night.
+cooldown_hours = 6
+
+[backup]
+# Where backups go. Empty disables the scheduled backup job; `collector backup
+# --to DIR` still works by hand. On Unraid point this at a different share from
+# the data, or better still an offsite target.
+directory = ""
+# Include published/ as well as the manifest. Turn this off if something else
+# already copies the array and only the manifest needs a consistent snapshot --
+# it is the part that cannot be rebuilt from the Parquet files.
+include_data = true
+# Backups to keep before the oldest are pruned.
+keep = 7

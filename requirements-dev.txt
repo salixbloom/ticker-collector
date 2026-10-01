@@ -1,0 +1,16 @@
+# Test and lint tooling, installed only into the `dev` image stage.
+# Generated with `make lock` from requirements-dev.in -- do not edit by hand.
+-r requirements.txt
+ast-serialize==0.11.2
+coverage==7.16.2
+iniconfig==2.3.0
+librt==0.16.0
+mypy==2.3.1
+mypy-extensions==1.1.0
+packaging==26.3
+pathspec==1.1.1
+pluggy==1.6.0
+pygments==2.21.0
+pytest==8.4.2
+pytest-cov==7.1.0
+ruff==0.16.9
