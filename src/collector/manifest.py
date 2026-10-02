@@ -26,7 +26,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: Batch lifecycle states.
 STAGED = "staged"
@@ -99,6 +99,17 @@ _MIGRATIONS: tuple[str, ...] = (
     """
     ALTER TABLE batches ADD COLUMN content_sha256 TEXT;
     CREATE INDEX idx_batches_content ON batches (dataset, content_sha256);
+    """,
+    # v4 -- small persistent facts the collector learns about the provider, the
+    # first being the oldest date its plan will still serve. Learned rather than
+    # configured, because the provider's history is a rolling window whose edge
+    # moves forward every day.
+    """
+    CREATE TABLE settings (
+        key        TEXT PRIMARY KEY,
+        value      TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
     """,
 )
 
@@ -428,6 +439,78 @@ class Manifest:
                 (dataset,),
             )
         }
+
+    # -- settings ------------------------------------------------------------ #
+
+    def get_setting(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO settings (key, value, updated_at) VALUES (?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                                               updated_at=excluded.updated_at
+                """,
+                (key, value, _iso(utcnow())),
+            )
+
+    def delete_setting(self, key: str) -> None:
+        with self.transaction() as conn:
+            conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+
+    # -- the provider's rolling history window -------------------------------- #
+
+    def history_floor(self, dataset: str) -> date | None:
+        """Oldest date the provider will serve for ``dataset``, if known."""
+        raw = self.get_setting(f"history_floor:{dataset}")
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return None
+
+    def raise_history_floor(self, dataset: str, floor: date) -> bool:
+        """Record that nothing before ``floor`` can be fetched. Returns True if raised.
+
+        Only ever moves forward. The provider's window rolls, so the floor can
+        rise but never fall -- and a lower value arriving later would mean asking
+        again for dates already proven unavailable.
+        """
+        current = self.history_floor(dataset)
+        if current is not None and floor <= current:
+            return False
+        self.set_setting(f"history_floor:{dataset}", floor.isoformat())
+        return True
+
+    def retire_before(self, dataset: str, floor: date, reason: str) -> int:
+        """Mark every outstanding unit older than ``floor`` as skipped, in one write.
+
+        One refusal tells us the whole date is outside the plan's window, for every
+        ticker -- so learning it once and retiring the rest in a single statement is
+        the difference between one API call and several hundred thousand.
+        """
+        with self.transaction() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE coverage
+                   SET state = ?, last_error = ?, updated_at = ?
+                 WHERE dataset = ? AND day < ? AND state IN (?, ?)
+                """,
+                (
+                    SKIPPED,
+                    reason,
+                    _iso(utcnow()),
+                    dataset,
+                    floor.isoformat(),
+                    PENDING,
+                    FAILED,
+                ),
+            )
+            return cursor.rowcount or 0
 
     # -- runs ---------------------------------------------------------------- #
 

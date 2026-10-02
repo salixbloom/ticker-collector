@@ -29,12 +29,13 @@ import pyarrow as pa
 from . import backup as backup_module
 from . import checks, money, parse, schemas, storage
 from . import manifest as manifest_module
+from . import source as source_module
 from . import status as status_module
 from .checks import CheckContext
 from .checks.trading_calendar import EXCHANGE_TZ, TradingCalendar
 from .config import Config
 from .manifest import Manifest
-from .source import Client, PartialResponse, SourceError
+from .source import Client, NotAuthorizedError, PartialResponse, SourceError
 from .status import JobStatus
 
 log = logging.getLogger(__name__)
@@ -125,6 +126,81 @@ class Context:
 
 
 # --------------------------------------------------------------------------- #
+# The provider's rolling history window
+# --------------------------------------------------------------------------- #
+
+#: Reason recorded against units retired for being outside the plan's window.
+AGED_OUT = "outside the provider's history window; this date can no longer be fetched"
+
+
+def history_floor(ctx: Context, dataset: str, *, today: date) -> date:
+    """The oldest date worth asking for, as currently understood.
+
+    Two inputs. The **learned** floor comes from the provider actually refusing a
+    date, and only ever moves forward. The **configured** floor is
+    ``backfill_days`` minus a safety margin, which keeps the first run off the
+    very edge of the window -- without it every run spends calls rediscovering
+    that the oldest day has just aged out.
+    """
+    margin = ctx.config.collection.history_safety_days
+    span = max(ctx.config.collection.backfill_days - margin, 1)
+    configured = today - timedelta(days=span)
+    learned = ctx.manifest.history_floor(dataset)
+    return max(configured, learned) if learned else configured
+
+
+#: Ticker used to probe the provider's window. Liquid and long-listed, so it has
+#: data on every day the plan covers.
+PROBE_TICKER = "AAPL"
+
+
+def note_unauthorized(ctx: Context, dataset: str, day: date, *, today: date) -> int:
+    """Learn the provider's real window edge, then retire everything below it.
+
+    A refusal only tells us that *this* date is gone. Setting the floor to
+    ``day + 1`` and walking on would then refuse the next date too, and the next:
+    the floor would crawl forward one API call at a time, which is the problem it
+    was meant to solve.
+
+    So one refusal triggers a single probe that returns the actual boundary (see
+    ``source.probe_history_floor``), and everything below it is retired in one
+    write. Worst case that is two calls, not one per dead day.
+    """
+    floor = _discover_floor(ctx, today=today) or (day + timedelta(days=1))
+    retired = 0
+    # The window is a property of the plan, not of a dataset: measured on
+    # 2026-10-02, minute and EOD refused and served exactly the same dates.
+    for owner in ("eod", "minute"):
+        ctx.manifest.raise_history_floor(owner, floor)
+        retired += ctx.manifest.retire_before(owner, floor, AGED_OUT)
+    log.warning(
+        "%s: %s is outside the provider's history window. Its oldest available "
+        "date is %s; retired %d outstanding unit(s) older than that. Data before "
+        "that date can no longer be fetched from this plan.",
+        dataset,
+        day.isoformat(),
+        floor.isoformat(),
+        retired,
+    )
+    return retired
+
+
+def _discover_floor(ctx: Context, *, today: date) -> date | None:
+    """Ask the provider where its window starts. One call, cached by the caller."""
+    oldest = today - timedelta(days=ctx.config.collection.backfill_days + 60)
+    try:
+        found = source_module.probe_history_floor(
+            ctx.client, PROBE_TICKER, oldest, today - timedelta(days=1)
+        )
+    except (SourceError, PartialResponse) as exc:
+        log.warning("could not probe the provider's history window: %s", exc)
+        return None
+    if found is not None:
+        log.info("provider history window starts %s", found.isoformat())
+    return found
+
+
+# --------------------------------------------------------------------------- #
 # EOD
 # --------------------------------------------------------------------------- #
 
@@ -140,7 +216,11 @@ def expected_eod_days(ctx: Context, *, today: date, backfill_days: int | None = 
     # would quietly substitute the configured 730-day window instead.
     days = backfill_days if backfill_days is not None else ctx.config.collection.backfill_days
     end = today - timedelta(days=1)
-    return ctx.calendar.trading_days(end - timedelta(days=days), end)
+    start = end - timedelta(days=days)
+    # Never expect a date the provider has already refused, or one inside the
+    # safety margin at the edge of its rolling window.
+    start = max(start, history_floor(ctx, "eod", today=today))
+    return ctx.calendar.trading_days(start, end)
 
 
 def run_eod(
@@ -170,9 +250,34 @@ def run_eod(
         gaps = gaps[:max_days]
     log.info("eod: %d expected day(s), %d gap(s) to fill", len(expected), len(gaps))
 
+    # Re-read before each fetch: a refusal mid-loop raises it, and the `gaps`
+    # list was materialised before any of that happened. Without this check the
+    # loop keeps calling the API for days it has just proven unavailable.
+    floor = ctx.manifest.history_floor("eod")
+
     for gap in gaps:
+        if floor is not None and gap.day < floor:
+            ctx.manifest.mark_coverage(
+                "eod",
+                gap.day,
+                manifest_module.SKIPPED,
+                error=AGED_OUT,
+                increment_attempt=False,
+            )
+            result.skipped += 1
+            continue
         try:
             outcome = _collect_eod_day(ctx, gap.day, run_id=run_id)
+        except NotAuthorizedError:
+            # Permanent for this date and every earlier one. One probe finds the
+            # real edge and the rest are retired in a single write.
+            retired = note_unauthorized(ctx, "eod", gap.day, today=today)
+            result.skipped += 1 + retired
+            ctx.manifest.mark_coverage(
+                "eod", gap.day, manifest_module.SKIPPED, error=AGED_OUT, increment_attempt=False
+            )
+            floor = ctx.manifest.history_floor("eod")
+            continue
         except (SourceError, PartialResponse) as exc:
             message = f"{gap.day.isoformat()}: {exc}"
             log.warning("eod: %s", message)
@@ -605,9 +710,9 @@ def run_minute(
     )
 
     if chunk_days > 1:
-        calls = _backfill_minute(ctx, result, days, working, chunk_days, max_calls, run_id)
+        calls = _backfill_minute(ctx, result, days, working, chunk_days, max_calls, run_id, today)
     else:
-        calls = _collect_minute_daily(ctx, result, days, max_calls, run_id, set(working))
+        calls = _collect_minute_daily(ctx, result, days, max_calls, run_id, set(working), today)
 
     # Publish any day that is now complete, including ones finished by an earlier
     # interrupted run.
@@ -643,7 +748,8 @@ def expected_minute_days(
     """Trading days minute data is expected for, ending yesterday."""
     window = backfill_days if backfill_days is not None else ctx.config.collection.backfill_days
     end = today - timedelta(days=1)
-    return ctx.calendar.trading_days(end - timedelta(days=window), end)
+    start = max(end - timedelta(days=window), history_floor(ctx, "minute", today=today))
+    return ctx.calendar.trading_days(start, end)
 
 
 def _minute_day_outstanding(ctx: Context, day: date) -> int:
@@ -658,10 +764,14 @@ def _collect_minute_daily(
     max_calls: int | None,
     run_id: str,
     wanted_tickers: set[str],
+    today: date,
 ) -> int:
     """One call per ticker-day. The daily path, and the simple one."""
     calls = 0
     wanted_days = set(days)
+    floor = ctx.manifest.history_floor("minute")
+    if floor is not None:
+        wanted_days = {d for d in wanted_days if d >= floor}
     for gap in ctx.manifest.gaps("minute"):
         if gap.day not in wanted_days or gap.ticker not in wanted_tickers:
             continue
@@ -671,6 +781,14 @@ def _collect_minute_daily(
         calls += 1
         try:
             _fetch_minute_range(ctx, gap.ticker, gap.day, gap.day, run_id=run_id)
+        except NotAuthorizedError:
+            # One refusal, one probe, then every dead date retired at once --
+            # otherwise the whole budget goes on calls that cannot succeed.
+            retired = note_unauthorized(ctx, "minute", gap.day, today=today)
+            result.skipped += retired
+            floor = ctx.manifest.history_floor("minute") or gap.day
+            wanted_days = {d for d in wanted_days if d >= floor}
+            continue
         except (SourceError, PartialResponse) as exc:
             message = f"{gap.day.isoformat()} {gap.ticker}: {exc}"
             log.warning("minute: %s", message)
@@ -689,6 +807,7 @@ def _backfill_minute(
     chunk_days: int,
     max_calls: int | None,
     run_id: str,
+    today: date,
 ) -> int:
     """One call per ticker per date range, split across daily partitions.
 
@@ -734,6 +853,13 @@ def _backfill_minute(
                     start, end = chunk[0], chunk[-1]
                     log.info("minute: %s hit the bar cap, narrowing to %dd", ticker, width)
                     continue
+                except NotAuthorizedError:
+                    retired = note_unauthorized(ctx, "minute", end, today=today)
+                    result.skipped += retired
+                    floor = ctx.manifest.history_floor("minute") or end
+                    pending = [d for d in pending if d >= floor]
+                    chunk = []
+                    break
                 except SourceError as exc:
                     result.errors.append(f"{ticker} {start}..{end}: {exc}")
                     for day in chunk:
@@ -746,6 +872,10 @@ def _backfill_minute(
                         )
                     break
                 break
+            if not chunk:
+                # The chunk was retired wholesale by the history floor; `pending`
+                # has already been narrowed, so do not also slice it here.
+                continue
             pending = pending[len(chunk) :]
     return calls
 
@@ -786,14 +916,18 @@ def _fetch_minute_range(
         if local_day in by_day:
             by_day[local_day].append(row)
 
+    floor = ctx.manifest.history_floor("minute")
     for day, rows in by_day.items():
         if not rows:
+            # A range straddling the window edge returns OK and silently clips, so
+            # an empty day below the floor is aged out rather than simply quiet.
+            aged_out = floor is not None and day < floor
             ctx.manifest.mark_coverage(
                 "minute",
                 day,
                 manifest_module.SKIPPED,
                 ticker=ticker,
-                error="no bars returned for this ticker-day",
+                error=AGED_OUT if aged_out else "no bars returned for this ticker-day",
             )
             continue
         parsed = parse.minute(

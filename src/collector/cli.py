@@ -115,6 +115,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-checksums", action="store_true", help="skip re-hashing published files"
     )
 
+    history = sub.add_parser("history", help="show or reset the learned provider history floor")
+    history.add_argument(
+        "--reset",
+        action="store_true",
+        help="forget the learned floor, e.g. after upgrading the plan",
+    )
+
     alert_test = sub.add_parser("alert-test", help="send a test alert to the configured webhook")
     alert_test.add_argument("--message", default="test alert from tick-collector")
 
@@ -153,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         "restore": cmd_restore,
         "verify-backup": cmd_verify_backup,
         "burnin": cmd_burnin,
+        "history": cmd_history,
         "alert-test": cmd_alert_test,
     }
     return handlers[args.command](config, args)
@@ -408,17 +416,25 @@ def _register_jobs(
 
 
 def _minute_runner(ctx: jobs.Context):
-    """The scheduled minute job, bounded so it cannot run past the next day.
+    """The scheduled minute job: chunked, and bounded by the call budget.
 
-    The plan has this job "run until done", but a two-year backfill is ~5,000
-    calls at 5/minute. Bounding each run keeps the scheduler responsive and the
-    remainder is simply picked up tomorrow; nothing is lost because progress is
-    recorded per ticker-day.
+    **Chunked even for daily collection.** A chunk covers the days a ticker
+    actually has outstanding, so in steady state that is one day and the request
+    is identical to an unchunked one. During a backfill it is up to
+    ``minute_backfill_chunk_days`` days per call, which is the difference between
+    finishing in days and finishing in a year: 1,000 tickers over two years is
+    ~502,000 ticker-days, so one call each would be ~400 days of running at this
+    budget, against ~11 chunked.
+
+    Bounded because the plan's "runs until done" would otherwise still be going
+    when the next slot came round. The remainder resumes tomorrow and nothing is
+    lost, since progress is recorded per ticker-day.
     """
     budget = ctx.config.collection.minute_calls_per_run
+    chunk = ctx.config.collection.minute_backfill_chunk_days
 
     def run(_ctx: jobs.Context) -> jobs.JobResult:
-        return jobs.run_minute(_ctx, max_calls=budget)
+        return jobs.run_minute(_ctx, max_calls=budget, chunk_days=chunk)
 
     return run
 
@@ -689,6 +705,50 @@ def cmd_burnin(config: Config, args: argparse.Namespace) -> int:
         journal.write_text(burnin.journal_entry(report, paths), encoding="utf-8")
         print(f"\nwrote {journal}")
     return 0 if report.passed else 1
+
+
+def cmd_history(config: Config, args: argparse.Namespace) -> int:
+    """Show the oldest date the provider will still serve, per dataset.
+
+    The window rolls forward, so this is learned from the provider's own refusals
+    rather than configured. A date below the floor can never be fetched again --
+    if it was not collected before it aged out, it is gone.
+    """
+    paths = storage.DataPaths.from_root(config.data_root).ensure()
+    datasets = ("eod", "minute")
+    with manifest_module.Manifest(paths.manifest_db) as man:
+        if args.reset:
+            for dataset in datasets:
+                man.delete_setting(f"history_floor:{dataset}")
+            print(
+                "forgot the learned history floor; the next run will rediscover it "
+                "from the provider"
+            )
+            return 0
+
+        margin = config.collection.history_safety_days
+        span = max(config.collection.backfill_days - margin, 1)
+        configured = date.today() - timedelta(days=span)
+        print(
+            f"configured oldest date: {configured.isoformat()}  "
+            f"(backfill_days={config.collection.backfill_days} "
+            f"less history_safety_days={margin})"
+        )
+        for dataset in datasets:
+            learned = man.history_floor(dataset)
+            retired = man.conn.execute(
+                "SELECT COUNT(*) AS n FROM coverage WHERE dataset = ? AND state = ? "
+                "AND last_error LIKE 'outside the provider%'",
+                (dataset, manifest_module.SKIPPED),
+            ).fetchone()["n"]
+            if learned is None:
+                print(f"{dataset:<8} learned floor: (none yet)")
+            else:
+                print(
+                    f"{dataset:<8} learned floor: {learned.isoformat()}  "
+                    f"({retired} unit(s) retired as aged out)"
+                )
+    return 0
 
 
 def cmd_alert_test(config: Config, args: argparse.Namespace) -> int:

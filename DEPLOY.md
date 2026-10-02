@@ -99,7 +99,7 @@ authenticated. It prints a line per check and exits non-zero if anything failed:
 [  ok] permissions      published/ staging/ quarantine/ state/ logs/ work/ all writable
 [  ok] atomic publish   published/, staging/, quarantine/ share a filesystem
 [  ok] disk space       1009.7 GB free
-[  ok] manifest         schema v3, 0 batch(es) recorded
+[  ok] manifest         schema v4, 0 batch(es) recorded
 [  ok] api key          present in the environment
 [  ok] api reachable    api.massive.com reachable and authenticated
 [  ok] published files  0
@@ -149,23 +149,74 @@ catch_up_on_start = false
 The first reference snapshot takes ~15 minutes on its own: it pages through all
 36,000-odd tickers, active and delisted, at 5 calls/minute.
 
+**Minute collection is chunked**, including on the nightly schedule: one call
+covers up to `minute_backfill_chunk_days` (40) days for a ticker. In steady state
+a ticker has one day outstanding so the request is a single day anyway; during a
+backfill it is ~40x fewer calls. Unchunked, 1,000 tickers over two years is
+~502,000 calls — over a year of nightly runs instead of about eleven days.
+
 **Minute bars are the expensive part.** Measured on real data: ~891 bars per
 ticker-day with extended hours, ~19 MB for a 1,000-ticker day, ~4.8 GB a year.
-Collection costs about one call per ticker-day, so a 1,000-ticker universe is
-~200 minutes a day at 5 calls/minute, and a two-year backfill is ~13,000 calls —
-about 1.8 days of continuous running. `[collection] minute_calls_per_run` bounds
-each scheduled run so it cannot still be going when the next slot arrives; the
-remainder resumes the following evening, and nothing is lost because progress is
-recorded per ticker-day.
+
+Steady state costs one call per ticker per evening, so a 1,000-ticker universe is
+~200 minutes a night at 5 calls/minute. A two-year backfill is ~13,000 chunked
+calls, which at the default budget is about eleven nights.
+`[collection] minute_calls_per_run` bounds each scheduled run so it cannot still
+be going when the next slot arrives; the remainder resumes the following evening,
+and nothing is lost because progress is recorded per ticker-day.
 
 To backfill minute history deliberately rather than waiting for the nightly job:
 
 ```sh
 docker exec tick-collector python -m collector minute --days 730 --chunk-days 40
+docker exec tick-collector python -m collector history
 ```
 
-`--chunk-days 40` requests a range per call instead of a single day, which is
-roughly a sixth of the requests.
+To finish a minute backfill faster, raise the per-run budget in
+`config/collector.toml` — 1,200 is conservative against the 7,200/day the rate
+limit actually allows:
+
+```toml
+[collection]
+minute_calls_per_run = 5000
+```
+
+## The provider's history window
+
+**The plan serves a rolling ~730-day window, and its edge moves forward every
+day.** Measured on 2026-10-02: a request for 2024-10-02 was served, 2024-10-01 was
+refused with `403 NOT_AUTHORIZED`. EOD and minute share exactly the same boundary.
+
+Two consequences worth understanding before the first backfill:
+
+- **A date not collected before it ages out is gone permanently.** That is the
+  whole reason continuous collection and backups matter — the archive becomes
+  irreplaceable as the window slides past it.
+- **The collector learns the boundary rather than assuming it.** The first refusal
+  triggers a single probe that returns the real edge, and every outstanding unit
+  older than it is retired in one write. That is 2 API calls, not one per dead
+  date.
+
+```sh
+docker exec tick-collector python -m collector history
+```
+
+```
+configured oldest date: 2024-10-07  (backfill_days=730 less history_safety_days=5)
+eod      learned floor: 2024-10-02  (7 unit(s) retired as aged out)
+minute   learned floor: 2024-10-02  (0 unit(s) retired as aged out)
+```
+
+`history_safety_days` keeps requests off the very edge. Without it,
+`backfill_days = 730` asks for precisely the date being refused, and every run
+spends calls rediscovering that the oldest day has just aged out.
+
+If you upgrade your plan to a longer history, clear the learned floor so the
+collector re-discovers it:
+
+```sh
+docker exec tick-collector python -m collector history --reset
+```
 
 ## The daily schedule
 
@@ -199,6 +250,16 @@ docker exec tick-collector python -m collector reference
 docker exec tick-collector python -m collector corporate-actions
 docker exec tick-collector python -m collector universe          # no API calls
 docker exec tick-collector python -m collector minute --days 730 --chunk-days 40
+docker exec tick-collector python -m collector history
+```
+
+To finish a minute backfill faster, raise the per-run budget in
+`config/collector.toml` — 1,200 is conservative against the 7,200/day the rate
+limit actually allows:
+
+```toml
+[collection]
+minute_calls_per_run = 5000
 ```
 
 These share the container's rate limiter only if run inside it, as above. Don't
@@ -357,6 +418,7 @@ docker compose up -d --build
 | Healthy but collecting nothing | `doctor`. Most likely no API key, in which case the log says so at startup and jobs are not registered at all. |
 | `must be on one filesystem` | `published/`, `staging/` and `quarantine/` are split across mounts. Point `COLLECTOR_DATA_DIR` at a single share. |
 | Unhealthy in Dockge | `collector status` shows which job failed and why. Quarantined batches sit in `/data/quarantine/<batch>/` with a `check_report.json` explaining the rejection. |
+| `NOT_AUTHORIZED` / "plan doesn't include this data timeframe" | The date is older than the rolling window. Expected at the trailing edge, and handled: the collector learns the boundary and retires those dates. `collector history` shows it. If it is happening for *recent* dates, check the key. |
 | Minute days never publish | A day publishes only when every universe ticker is accounted for. `collector gaps --dataset minute` lists what is outstanding; a ticker that keeps failing is named there with its error. |
 | `no universe snapshot to collect against` | The minute job needs a universe, which derives from published EOD data. Run `collector universe` (or let the monthly slot do it) once EOD exists. |
 | No alerts arriving | `collector alert-test`. If that works but a real failure was silent, it was probably inside the dedup cooldown — check `state/alerts.json`. |

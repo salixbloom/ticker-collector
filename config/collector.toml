@@ -34,8 +34,17 @@ types = []
 # Collect pre/post-market minute bars. Cheap to store, impossible to recover
 # after the 2-year window passes.
 extended_hours = true
-# Trading-day history to maintain (free plan ceiling is 2 years).
+# Trading-day history to maintain. The plan's ceiling is a ROLLING ~2-year
+# window: measured on 2026-10-02, minute and EOD bars were served for 2024-10-04
+# but refused for 2024-10-01. The edge moves forward every day, so a date not
+# collected before it ages out is gone permanently.
 backfill_days = 730
+# Kept back from the oldest requested date, so requests stay inside that edge
+# rather than sitting on it. Without a margin, `backfill_days = 730` asks for
+# precisely the date the provider refuses, and every run burns calls relearning
+# it. The collector also *learns* the real floor from any refusal and never asks
+# below it again -- see `collector history`.
+history_safety_days = 5
 # API calls the scheduled minute job may spend per run. A 1,000-ticker day costs
 # ~1,000 calls = ~200 minutes at 5/minute, so this allows a day plus some catch-up
 # without the run still going when tomorrow's slot arrives.

@@ -57,6 +57,12 @@ class CollectionConfig:
     #: 1,000-ticker day costs ~200 minutes, so an unbounded run would still be
     #: going when the next slot came round. The remainder resumes tomorrow.
     minute_calls_per_run: int = 1200
+    #: Kept back from the oldest requested date. The provider serves a rolling
+    #: history window whose edge moves forward every day, so asking for exactly
+    #: `backfill_days` sits on that edge and every run wastes calls discovering
+    #: that the oldest day has just aged out. Measured: the window is ~730 days,
+    #: and `backfill_days = 730` requested precisely the date being refused.
+    history_safety_days: int = 5
     #: Days per call when backfilling minute bars. One call returns up to 50,000
     #: bars and a dense extended-hours day is ~960, so 40 days leaves headroom.
     minute_backfill_chunk_days: int = 40
@@ -221,6 +227,13 @@ def validate(config: Config) -> None:
         raise ConfigError("[universe] grace_days must not be negative")
     if config.collection.backfill_days < 1:
         raise ConfigError("[collection] backfill_days must be at least 1")
+    if config.collection.history_safety_days < 0:
+        raise ConfigError("[collection] history_safety_days must not be negative")
+    if config.collection.history_safety_days >= config.collection.backfill_days:
+        raise ConfigError(
+            "[collection] history_safety_days must be smaller than backfill_days, "
+            "or there would be no window left to collect"
+        )
     if config.collection.minute_calls_per_run < 1:
         raise ConfigError("[collection] minute_calls_per_run must be at least 1")
     if not 1 <= config.collection.minute_backfill_chunk_days <= 120:

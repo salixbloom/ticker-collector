@@ -56,6 +56,7 @@ The container entry point is `python -m collector`:
 | `backup` / `restore` | Verified backup and restore. `backups`, `verify-backup` too. |
 | `burnin` | M10 status: consecutive clean trading days. `--journal` for the write-up. |
 | `alert-test` | Send a test alert to the configured webhook. |
+| `history` | Show or reset the learned provider history floor. |
 | `gaps` | Show what a dataset still owes. |
 
 ## How it works
@@ -137,6 +138,19 @@ difference between a two-year backfill taking days and taking weeks.
 zstd level 9 is the default because it was measured, not assumed: on real minute
 bars, levels 3/9/15 give 20.8 / 20.0 / 19.5 bytes per row, so 9 takes most of the
 available saving and 15 adds 2.5% for noticeably more CPU.
+
+## The provider's history window
+
+The plan serves a rolling ~730-day window whose edge moves forward daily — EOD and
+minute share the same boundary, measured. A date not collected before it ages out
+cannot be fetched again, which is what makes continuous collection and backups
+matter rather than being nice to have.
+
+The collector **learns** that boundary instead of assuming it. One refusal triggers
+a single probe (a range request straddling the edge returns OK and silently clips,
+so its first bar *is* the boundary), the floor is persisted, and every outstanding
+unit older than it is retired in one write. Two API calls, not one per dead date.
+`collector history` shows it; `--reset` re-discovers it after a plan upgrade.
 
 ## Monitoring and backups
 

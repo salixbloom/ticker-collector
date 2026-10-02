@@ -58,6 +58,21 @@ class NotAdjustedError(SourceError):
     """The provider returned adjusted data when raw was requested."""
 
 
+class NotAuthorizedError(SourceError):
+    """The plan does not cover what was asked for.
+
+    Distinct from a transient failure because it is **permanent for that
+    request**: retrying it can never succeed. The provider serves a rolling
+    history window, so a date that has aged out of it will be refused forever,
+    and treating that as a retryable error burns the whole call budget relearning
+    the same fact.
+    """
+
+    def __init__(self, message: str, *, day: date | None = None) -> None:
+        super().__init__(message)
+        self.day = day
+
+
 @dataclass
 class Response:
     """One decoded API response."""
@@ -142,6 +157,11 @@ class Client:
             else:
                 if response.status_code not in RETRYABLE_STATUS:
                     if response.status_code >= 400:
+                        if _is_not_authorized(response):
+                            raise NotAuthorizedError(
+                                f"HTTP {response.status_code} for {path_or_url}: "
+                                f"{response.text[:200]}"
+                            )
                         raise SourceError(
                             f"HTTP {response.status_code} for {path_or_url}: {response.text[:200]}"
                         )
@@ -297,6 +317,18 @@ def _assert_unadjusted(response: Response, what: str) -> None:
         )
 
 
+def _is_not_authorized(response: httpx.Response) -> bool:
+    """Whether a 4xx is the provider saying "your plan does not cover this"."""
+    if response.status_code not in (401, 403):
+        return False
+    try:
+        return response.json().get("status") == "NOT_AUTHORIZED"
+    except ValueError:
+        # A 403 without a parseable body is still an authorization failure, but we
+        # cannot tell a plan limit from a bad key, so leave it retryable-shaped.
+        return False
+
+
 def _retry_after_seconds(response: httpx.Response) -> float | None:
     raw = response.headers.get("Retry-After")
     if not raw:
@@ -318,6 +350,35 @@ def build(config: Config, limiter: RateLimiter | None = None) -> Client:
         config=config,
         limiter=limiter or RateLimiter(config.source.calls_per_minute),
     )
+
+
+def probe_history_floor(client: Client, ticker: str, oldest: date, newest: date) -> date | None:
+    """The oldest date the provider will actually serve, in one call.
+
+    Exploits a measured behaviour: a range request that straddles the edge of the
+    plan's history window returns ``200 OK`` and **silently clips** to what the
+    plan covers. Asking for a range starting well before the window therefore
+    hands back the boundary itself as the first bar's date -- no binary search
+    needed, and no guessing from a refusal.
+
+    Verified 2026-10-02: ``2024-09-27..2024-11-15`` returned ``status: OK`` with
+    its first bar on 2024-10-02, while a single-day request for 2024-10-01 was
+    refused outright.
+
+    Returns ``None`` if the provider has no data at all for the range, which is
+    indistinguishable from the ticker simply not trading then.
+    """
+    assert client.http is not None
+    # Deliberately not `aggregates()`: that treats a response at the row limit as
+    # truncated, and here a single row is exactly what we want.
+    response = client.get(
+        f"/v2/aggs/ticker/{ticker}/range/1/day/{oldest.isoformat()}/{newest.isoformat()}",
+        {"adjusted": "false", "sort": "asc", "limit": 1},
+    )
+    results = response.results
+    if not results or "t" not in results[0]:
+        return None
+    return datetime.fromtimestamp(results[0]["t"] / 1000, tz=UTC).date()
 
 
 def iter_date_chunks(start: date, end: date, days: int) -> Iterator[tuple[date, date]]:

@@ -7,10 +7,11 @@ tagged `[USER]` / `[CODE]` / `[TOOL]` / `[ASSUMPTION]`.
 validates it and stores it compactly, per `data-collector-micro-plan.md`. Phase 1
 of the Quant School project.
 
-**State as of 2026-10-01:** feature-complete. M0–M7 and M9 are done and verified
-against the live API; M8 was skipped by the user's choice. M10 is an
-observation over 10 trading days, so its apparatus is built and tested but the
-clock only runs once deployed. **Ready to deploy** — see `DEPLOY.md`.
+**State as of 2026-10-02:** feature-complete and **deployed** on the user's
+Unraid box. M0–M7 and M9 done; M8 skipped by request; M10's clock is running.
+The first deployment exposed a real bug in how the provider's rolling history
+window was handled — fixed and verified live (see [DISCOVERIES] / [PROGRESS]).
+The user must redeploy to pick that up.
 
 ---
 
@@ -48,6 +49,36 @@ clock only runs once deployed. **Ready to deploy** — see `DEPLOY.md`.
   throwaway temp directory. It needs a decision on where `/data` should live.
 
 ## [DECISIONS]
+
+### The provider's rolling history window (2026-10-02)
+
+- 2026-10-02T19:40Z [TOOL] **The plan serves a rolling ~730-day window, and EOD and
+  minute share exactly the same edge.** Measured: 2024-10-02 served, 2024-10-01
+  refused `403 NOT_AUTHORIZED`, on both the grouped-daily and minute endpoints. My
+  first reading of the logs -- that minute had *less* history than EOD -- was wrong;
+  probing both endpoints on the same dates disproved it.
+- 2026-10-02T19:45Z [TOOL] **A range request straddling the edge returns `200 OK`
+  and silently clips.** `2024-09-27..2024-11-15` came back with its first bar on
+  2024-10-02. That is exploited for discovery: one such request returns the
+  boundary directly, so no binary search and no guessing from refusals.
+- 2026-10-02T19:50Z [CODE] `NotAuthorizedError` is a distinct exception, because a
+  plan limit is **permanent for that request** while every other error is worth
+  retrying. Only the provider's own `NOT_AUTHORIZED` marker counts -- a bare 403
+  could equally be a bad key, and must stay retryable-shaped.
+- 2026-10-02T19:50Z [CODE] On refusal: probe once for the real edge, raise a
+  persisted `history_floor` (manifest migration v4 adds a `settings` table), and
+  retire every outstanding unit below it in **one SQL statement**. The floor only
+  ever moves forward, since the window rolls and a lower value would re-ask dates
+  already proven dead.
+- 2026-10-02T19:55Z [CODE] `[collection] history_safety_days = 5` keeps requests
+  off the edge. Without a margin, `backfill_days = 730` asks for precisely the
+  refused date, and every run spends calls rediscovering that the oldest day has
+  just aged out.
+- 2026-10-02T20:05Z [CODE] **The scheduled minute job now chunks too.** It was
+  using one call per ticker-day, which for 1,000 tickers over two years is
+  ~502,000 calls -- over a year of nightly runs. Chunking costs nothing in steady
+  state (a ticker with one day outstanding yields a single-day request) and is
+  ~40x cheaper during a backfill.
 
 ### M9/M10 (2026-10-01)
 
@@ -325,6 +356,42 @@ clock only runs once deployed. **Ready to deploy** — see `DEPLOY.md`.
   that was chosen; whether to raise the scale is an open question for the user.
 - 2026-10-01T05:50Z [TOOL] Splits/dividends/tickers all expose a stable `id`;
   dividends also expose `currency` and a `frequency` that can be 0.
+
+### The deployment's first real failure (2026-10-02)
+
+Symptom from the user's logs: the minute job spent its entire 1,200-call budget
+per run on `403 NOT_AUTHORIZED`, reported `502,000 ticker-day(s) still owed`, and
+collected **nothing**. EOD had completed (501 days) with exactly one day failing.
+
+Four distinct faults, each of which alone would have stalled it:
+
+- **A plan limit was treated as a retryable failure.** Refused ticker-days were
+  marked `failed`, so they stayed owed and were retried every run forever.
+- **`backfill_days = 730` asked for precisely the refused date.** The window is
+  ~730 days *rolling*, so the computed start sat exactly on -- or one day past --
+  the edge, and moved further out every day.
+- **Retiring one date per API call does not converge.** My first fix set the floor
+  to `refused + 1 day`; because gaps are worked oldest-first, the next date was
+  also refused, and the floor crawled forward one call at a time. Caught by a test
+  that asserted the call count, not just the outcome. Replaced with a single probe
+  for the real edge.
+- **Bulk-retiring the manifest rows was not enough.** `run_eod` iterates a gap
+  list materialised *before* the loop, so retired rows were still visited and
+  still cost a call each. The loop now re-checks the floor before every fetch.
+
+Verified live afterwards, with a deliberately over-reaching window:
+
+```
+eod: 508 expected day(s), 8 gap(s) to fill
+provider history window starts 2024-10-02
+eod: 2024-09-23 is outside the provider's history window. Its oldest available
+     date is 2024-10-02; retired 7 outstanding unit(s) older than that.
+eod: published=1 quarantined=0 errors=0 outcome=soft_flags
+```
+
+Two calls to learn the boundary, then it collects. A second run made no refused
+calls at all. Aged-out days are `soft_flags`, not a `hard_failure`: they are
+expected at the trailing edge, not a fault.
 
 ### Bugs the first real burn-in report found in itself (2026-10-01)
 
@@ -778,6 +845,10 @@ live runs rather than by tests.
 
 ## Follow-ups
 
+- [ ] **Redeploy to pick up the history-window fix.** The running container has
+  502,000 bogus owed minute ticker-days; on the first run after the upgrade the
+  floor is discovered and they are retired in one write. The manifest migrates
+  v3 -> v4 automatically on open.
 - [ ] **Rotate the API key** — it was pasted into the chat transcript.
 - [ ] Run the full 2-year EOD backfill (~500 days, ~100 min) once `/data` has a
   real home.
