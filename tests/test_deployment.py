@@ -431,36 +431,52 @@ def test_the_compose_file_builds_from_source_so_no_registry_is_needed():
     assert "healthcheck:" in text
 
 
-def test_compose_drives_everything_from_env_so_only_one_file_is_edited():
+def test_compose_depends_on_no_env_file_in_the_stack_directory():
+    """Dockge edits compose.yaml and manages the stack directory around it.
+
+    A `.env` placed there can be rewritten or cleared. Every `${VAR:-default}`
+    would then silently fall back to its default, which is mostly harmless -- but
+    the API key has no default, so the collector would come up healthy, idle and
+    collecting nothing. So compose.yaml carries literal values instead.
+    """
     text = (REPO / "compose.yaml").read_text(encoding="utf-8")
-    for variable in (
-        "COLLECTOR_DATA_DIR",
+    assert "env_file" not in text
+    assert "${" not in text, "compose.yaml should not interpolate from a .env"
+
+
+def test_compose_reads_the_api_key_from_a_file_outside_the_stack_directory():
+    text = (REPO / "compose.yaml").read_text(encoding="utf-8")
+    assert "MASSIVE_API_KEY_FILE" in text
+    # Mounted from somewhere Dockge does not manage, read-only.
+    assert "/mnt/user/appdata/tick-collector/api_key:/run/secrets/api_key:ro" in text
+    # And never the key itself.
+    assert "MASSIVE_API_KEY:" not in text
+
+
+def test_compose_carries_every_setting_an_operator_changes():
+    """Because compose.yaml is the only file Dockge gives you an editor for."""
+    text = (REPO / "compose.yaml").read_text(encoding="utf-8")
+    for setting in (
+        "MASSIVE_API_KEY_FILE",
+        "COLLECTOR_ALERT_WEBHOOK",
+        "TZ:",
+        "COLLECTOR_LOG_LEVEL",
         "APP_UID",
         "APP_GID",
-        "TZ",
-        "COLLECTOR_VERSION",
+        "/data",
+        "/backups",
     ):
-        assert f"${{{variable}" in text, f"{variable} should be settable from .env"
+        assert setting in text, f"{setting} should be visible in compose.yaml"
 
 
-def test_every_compose_variable_is_documented_in_the_env_template():
-    """An operator editing .env in Dockge should not have to read compose.yaml."""
-    import re
-
-    compose = (REPO / "compose.yaml").read_text(encoding="utf-8")
-    template = (REPO / ".env.example").read_text(encoding="utf-8")
-    referenced = set(re.findall(r"\$\{([A-Z_][A-Z0-9_]*)", compose))
-    documented = set(re.findall(r"^#?\s*([A-Z_][A-Z0-9_]*)=", template, re.MULTILINE))
-    assert referenced <= documented, f"undocumented: {sorted(referenced - documented)}"
-
-
-def test_the_env_template_requires_only_the_api_key():
+def test_the_env_template_is_documented_as_the_fallback_path():
+    """It still serves plain `docker compose` and local development."""
     template = (REPO / ".env.example").read_text(encoding="utf-8")
     assert "MASSIVE_API_KEY=" in template
-    # Everything else ships with a usable default.
-    assert "COLLECTOR_DATA_DIR=/mnt/user/quant-data" in template
-    assert "APP_UID=99" in template
-    assert "APP_GID=100" in template
+    assert "MASSIVE_API_KEY_FILE" in template
+    # And it warns about the Dockge hazard rather than recommending itself.
+    assert "Dockge" in template
+    assert "cleared" in template
 
 
 def test_the_dev_compose_file_does_not_deploy_anything():

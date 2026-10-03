@@ -213,7 +213,18 @@ def cmd_doctor(config: Config, args: argparse.Namespace) -> int:
     def writable() -> str:
         paths.ensure()
         paths.check_writable()
-        return "published/ staging/ quarantine/ state/ logs/ all writable"
+        # Named from the paths actually probed, so the report cannot drift from
+        # what was checked.
+        probed = (
+            paths.published,
+            paths.staging,
+            paths.quarantine,
+            paths.state,
+            paths.logs,
+            paths.work,
+        )
+        names = " ".join(f"{d.name}/" for d in probed)
+        return f"{names} all writable"
 
     check("permissions", writable)
 
@@ -241,14 +252,16 @@ def cmd_doctor(config: Config, args: argparse.Namespace) -> int:
         return f"schema v{version}, {batches} batch(es) recorded"
 
     check("manifest", migrations)
-    check(
-        "api key",
-        lambda: (
-            "present in the environment"
-            if config.has_api_key()
-            else _fail("not set -- put MASSIVE_API_KEY in the stack's .env")
-        ),
-    )
+
+    def api_key() -> str:
+        # Reads the key rather than asking `has_api_key()`, so the reported fault
+        # is the real one -- "the file is empty" or "could not be read" -- instead
+        # of a generic "not set". The distinction is the whole diagnostic when a
+        # stack manager has rewritten the file.
+        _ = config.api_key
+        return f"present, from {config.api_key_source}"
+
+    check("api key", api_key)
 
     if not args.offline and config.has_api_key():
 

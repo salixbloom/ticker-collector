@@ -20,6 +20,8 @@ deployed — `collector burnin` measures it.
 Everything runs in a container; nothing is installed on the host.
 
 ```sh
+# Local development: a .env is fine here. Under Dockge use a key file instead
+# (see DEPLOY.md) -- the stack directory is not a safe place for secrets.
 cp .env.example .env        # then put your API key in it
 make check                  # ruff + mypy + pytest, all inside the dev image
 make up                     # build and run the collector
@@ -28,12 +30,15 @@ make logs                   # follow it
 ```
 
 **Deploying to Unraid with Dockge:** put this repository in the Dockge stack
-directory, fill in `.env`, press Deploy. Compose builds the image itself, so there
-is no registry involved. [`DEPLOY.md`](DEPLOY.md) has the walkthrough, the daily
-schedule and a troubleshooting table.
+directory, write the API key to a file outside it, press Deploy. Compose builds the
+image itself, so there is no registry involved. [`DEPLOY.md`](DEPLOY.md) has the
+walkthrough, the daily schedule and a troubleshooting table.
 
-Only `.env` should need editing -- `COLLECTOR_DATA_DIR` for the share, and
-`APP_UID`/`APP_GID` to match its owner (99:100 = `nobody:users`).
+Every setting lives in `compose.yaml`, which is the file Dockge edits — check the
+data-share path and that `APP_UID`/`APP_GID` match its owner (99:100 =
+`nobody:users`). Nothing is read from a `.env` in the stack directory: Dockge
+manages that directory, and a cleared `.env` would leave the collector healthy and
+idle with no key.
 
 ## Commands
 

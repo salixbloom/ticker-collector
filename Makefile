@@ -61,7 +61,7 @@ doctor:
 	docker compose exec collector python -m collector doctor
 
 # Validate the deployment stack without starting anything -- the quickest check
-# that compose.yaml and .env agree.
+# that compose.yaml is well-formed and its mounts resolve.
 config:
 	docker compose config
 

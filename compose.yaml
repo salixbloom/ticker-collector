@@ -1,15 +1,20 @@
 # tick-collector — Dockge / Unraid stack
 #
-# Dockge keeps each stack in its own directory (usually
-# /mnt/user/appdata/dockge/stacks/<name>) and manages `compose.yaml` plus `.env`
-# there. Put this repository in that directory, set the values in `.env`, and hit
-# Deploy — Compose builds the image on first start, so there is no registry to
-# push to and nothing to pull.
+# Dockge edits THIS file and treats it as the stack's source of truth, so
+# everything you need to change lives here, in `environment:` below. Nothing is
+# read from a `.env` in the stack directory: Dockge manages that directory and a
+# `.env` placed there can be rewritten or cleared, which would silently leave the
+# collector running with no API key — healthy-looking and collecting nothing.
 #
-# Everything an operator needs to change lives in `.env`, which Dockge gives you
-# an editor for. Nothing in this file should need editing.
+# The API key therefore comes from a file OUTSIDE the stack directory. Create it
+# once and nothing will touch it again:
 #
-# See DEPLOY.md for the walkthrough.
+#   mkdir -p /mnt/user/appdata/tick-collector
+#   printf '%s' 'your-key-here' > /mnt/user/appdata/tick-collector/api_key
+#   chmod 600 /mnt/user/appdata/tick-collector/api_key
+#   chown 99:100 /mnt/user/appdata/tick-collector/api_key
+#
+# Then press Deploy. See DEPLOY.md for the full walkthrough.
 
 services:
   collector:
@@ -18,41 +23,51 @@ services:
       target: app
       args:
         # Must match the owner of the data share below. Unraid's shares are
-        # nobody:users = 99:100, which is the default.
-        APP_UID: ${APP_UID:-99}
-        APP_GID: ${APP_GID:-100}
-    image: tick-collector:${COLLECTOR_VERSION:-0.1.0}
+        # nobody:users = 99:100.
+        APP_UID: "99"
+        APP_GID: "100"
+    image: tick-collector:0.1.0
     container_name: tick-collector
     restart: unless-stopped
 
-    env_file:
-      - path: .env
-        required: false
     environment:
-      # Only affects log timestamps; the scheduler's own timezone comes from
+      # Where the collector reads the API key from. The file lives outside this
+      # stack directory on purpose -- see the note at the top.
+      MASSIVE_API_KEY_FILE: /run/secrets/api_key
+      # Log timestamps only. The scheduler's own timezone comes from
       # config/collector.toml so the two cannot drift apart.
-      TZ: ${TZ:-America/New_York}
-      COLLECTOR_LOG_LEVEL: ${COLLECTOR_LOG_LEVEL:-INFO}
+      TZ: America/New_York
+      # INFO is right for normal running; DEBUG logs one line per API call.
+      COLLECTOR_LOG_LEVEL: INFO
       COLLECTOR_DATA_ROOT: /data
       COLLECTOR_CONFIG: /app/config/collector.toml
+      # Webhook for hard failures and recoveries. Works with Slack, Discord, ntfy
+      # and most self-hosted receivers. Uncomment and paste your URL.
+      # COLLECTOR_ALERT_WEBHOOK: https://discord.com/api/webhooks/...
 
     volumes:
+      # The API key, read-only. Create it first (see the note at the top), or the
+      # container comes up idle with a warning in the log.
+      - /mnt/user/appdata/tick-collector/api_key:/run/secrets/api_key:ro
+
       # Bulk data on the array. published/, staging/, quarantine/, state/, work/
       # and logs/ all live under here; they must stay on ONE filesystem or the
-      # atomic publish stops being atomic, which `collector init` refuses to start
-      # without.
-      - ${COLLECTOR_DATA_DIR:-/mnt/user/quant-data}:/data
-      # Thresholds, universe size, extended hours, compression level. Read-only:
-      # the collector never writes its own config.
+      # atomic publish stops being atomic, which `collector init` refuses to
+      # start without.
+      - /mnt/user/quant-data:/data
+
+      # Thresholds, universe size, extended hours, compression level, schedule
+      # timezone. Read-only: the collector never writes its own config.
       - ./config:/app/config:ro
+
       # Backups. Uncomment, and set [backup] directory = "/backups" in
       # config/collector.toml, to enable the nightly backup job. Use a different
       # share from the data above -- a backup on the same disk is not a backup.
-      # - ${COLLECTOR_BACKUP_DIR:-/mnt/user/backups/tick-collector}:/backups
+      # - /mnt/user/backups/tick-collector:/backups
 
     # Minute-day batches are small; this is ample and keeps a runaway job from
     # pressuring the rest of the server.
-    mem_limit: ${COLLECTOR_MEM_LIMIT:-2g}
+    mem_limit: 2g
     # The scheduler stops cleanly on SIGTERM, finishing the batch in flight
     # rather than leaving a partial file behind.
     stop_grace_period: 60s
@@ -73,8 +88,8 @@ services:
     logging:
       driver: json-file
       options:
-        max-size: ${COLLECTOR_LOG_MAX_SIZE:-16m}
-        max-file: ${COLLECTOR_LOG_MAX_FILE:-5}
+        max-size: 16m
+        max-file: "5"
 
     labels:
       org.opencontainers.image.title: tick-collector

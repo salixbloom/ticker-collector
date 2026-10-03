@@ -150,3 +150,103 @@ def test_blank_and_trivially_short_values_are_not_treated_as_secrets(monkeypatch
     assert secret_values() == []
     # A blank key is "no key", not an empty key.
     assert Config(data_root="/data").has_api_key() is False
+
+
+# --------------------------------------------------------------------------- #
+# The key from a file: survives a stack manager rewriting the stack directory
+# --------------------------------------------------------------------------- #
+
+
+def test_the_key_can_come_from_a_file(tmp_path, monkeypatch):
+    """Dockge manages the stack directory, so a `.env` there can be cleared.
+
+    Every other setting has a default and degrades quietly; a lost key leaves the
+    container healthy, idle and collecting nothing. A file outside that directory
+    is not something the stack manager touches.
+    """
+    key_file = tmp_path / "api_key"
+    key_file.write_text("sk-live-fromfile123\n", encoding="utf-8")
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(key_file))
+
+    config = load(write_config(tmp_path))
+    assert config.api_key == "sk-live-fromfile123"  # trailing newline stripped
+    assert config.has_api_key() is True
+
+
+def test_the_file_wins_over_the_environment(tmp_path, monkeypatch):
+    """The file is the deliberate configuration; a stale env var should not win."""
+    key_file = tmp_path / "api_key"
+    key_file.write_text("sk-live-fromfile", encoding="utf-8")
+    monkeypatch.setenv("MASSIVE_API_KEY", "sk-live-fromenv")
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(key_file))
+    assert load(write_config(tmp_path)).api_key == "sk-live-fromfile"
+
+
+def test_an_unreadable_key_file_says_so_rather_than_falling_back(tmp_path, monkeypatch):
+    """Silently using a different key would be worse than refusing."""
+    monkeypatch.setenv("MASSIVE_API_KEY", "sk-live-fromenv")
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(tmp_path / "missing"))
+    config = load(write_config(tmp_path))
+    with pytest.raises(ConfigError, match="could not be read"):
+        _ = config.api_key
+
+
+def test_an_empty_key_file_is_an_error(tmp_path, monkeypatch):
+    """The exact Dockge symptom: the file is there but its contents are gone."""
+    key_file = tmp_path / "api_key"
+    key_file.write_text("   \n", encoding="utf-8")
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(key_file))
+    config = load(write_config(tmp_path))
+    with pytest.raises(ConfigError, match="is empty"):
+        _ = config.api_key
+
+
+def test_a_file_supplied_key_is_still_redacted_from_logs(tmp_path, monkeypatch):
+    """Otherwise the safer configuration would be the one that leaks."""
+    key_file = tmp_path / "api_key"
+    key_file.write_text("sk-live-SECRETFROMFILE", encoding="utf-8")
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(key_file))
+
+    assert "sk-live-SECRETFROMFILE" in secret_values()
+
+    from collector.logging_setup import redact
+
+    assert "SECRETFROMFILE" not in redact(
+        "GET https://api.massive.com/v2/aggs?apiKey=sk-live-SECRETFROMFILE"
+    )
+
+
+def test_the_key_file_path_is_not_treated_as_a_secret(tmp_path, monkeypatch):
+    """Redacting the path would make every log line mentioning it unreadable."""
+    key_file = tmp_path / "api_key"
+    key_file.write_text("sk-live-abcdefgh", encoding="utf-8")
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(key_file))
+    assert str(key_file) not in secret_values()
+
+
+def test_the_key_source_is_reportable_without_the_key(tmp_path, monkeypatch):
+    key_file = tmp_path / "api_key"
+    key_file.write_text("sk-live-SECRET", encoding="utf-8")
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    monkeypatch.setenv("MASSIVE_API_KEY_FILE", str(key_file))
+
+    source = load(write_config(tmp_path)).api_key_source
+    assert "MASSIVE_API_KEY_FILE" in source
+    assert str(key_file) in source
+    assert "SECRET" not in source.replace(str(key_file), "")
+
+
+def test_no_key_anywhere_names_both_ways_to_set_it(tmp_path, monkeypatch):
+    for name in ("MASSIVE_API_KEY", "POLYGON_API_KEY", "MASSIVE_API_KEY_FILE"):
+        monkeypatch.delenv(name, raising=False)
+    config = load(write_config(tmp_path))
+    assert config.api_key_source == "not set"
+    with pytest.raises(ConfigError) as caught:
+        _ = config.api_key
+    message = str(caught.value)
+    assert "MASSIVE_API_KEY" in message
+    assert "MASSIVE_API_KEY_FILE" in message

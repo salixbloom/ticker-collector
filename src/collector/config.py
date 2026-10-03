@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 DEFAULT_CONFIG_PATH = Path("/app/config/collector.toml")
 
 #: Environment variables holding secrets. Their values are redacted from logs.
+#: The ``*_FILE`` variants hold a path, not a secret, so they are not listed.
 SECRET_ENV_VARS = ("MASSIVE_API_KEY", "POLYGON_API_KEY", "COLLECTOR_ALERT_WEBHOOK")
 
 
@@ -133,19 +134,54 @@ class Config:
 
     @property
     def api_key(self) -> str:
-        """The data provider API key, from the environment only.
+        """The data provider API key.
 
         Never stored on the config object: keeping it behind a property means a
         ``repr`` of the config, or a config dump into a log or status file, cannot
         leak it.
+
+        Read from a **file** first, then the environment. The file matters for
+        Dockge and similar stack managers: they treat ``compose.yaml`` as the
+        stack's source of truth and rewrite the stack directory around it, so a
+        ``.env`` living there can be cleared. Every other setting has a default
+        and degrades quietly, but a lost key leaves the container healthy, idle
+        and collecting nothing. Pointing ``MASSIVE_API_KEY_FILE`` at a path
+        *outside* the stack directory puts the secret somewhere nothing else
+        manages.
         """
+        for name in ("MASSIVE_API_KEY_FILE", "POLYGON_API_KEY_FILE"):
+            path = os.environ.get(name, "").strip()
+            if not path:
+                continue
+            try:
+                value = Path(path).read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ConfigError(f"{name}={path!r} could not be read: {exc}") from exc
+            if value:
+                return value
+            raise ConfigError(f"{name}={path!r} is empty")
+
         for name in ("MASSIVE_API_KEY", "POLYGON_API_KEY"):
             value = os.environ.get(name, "").strip()
             if value:
                 return value
+
         raise ConfigError(
-            "no API key: set MASSIVE_API_KEY in the environment file (see .env.example)"
+            "no API key. Set MASSIVE_API_KEY, or MASSIVE_API_KEY_FILE pointing at a "
+            "file that holds it (safer under Dockge, which can rewrite the stack "
+            "directory). See .env.example and DEPLOY.md."
         )
+
+    @property
+    def api_key_source(self) -> str:
+        """Where the key came from, for diagnostics. Never the key itself."""
+        for name in ("MASSIVE_API_KEY_FILE", "POLYGON_API_KEY_FILE"):
+            if os.environ.get(name, "").strip():
+                return f"{name}={os.environ[name].strip()}"
+        for name in ("MASSIVE_API_KEY", "POLYGON_API_KEY"):
+            if os.environ.get(name, "").strip():
+                return f"{name} (environment)"
+        return "not set"
 
     def has_api_key(self) -> bool:
         try:
@@ -261,11 +297,31 @@ def validate(config: Config) -> None:
         raise ConfigError(f"[scheduler] unknown timezone {config.scheduler.timezone!r}") from exc
 
 
+#: Environment variables naming a *file* that holds a secret. The variable itself
+#: is a path and harmless; what it points at must still be redacted.
+SECRET_FILE_ENV_VARS = ("MASSIVE_API_KEY_FILE", "POLYGON_API_KEY_FILE")
+
+
 def secret_values() -> list[str]:
-    """Current secret values, for the log redaction filter."""
+    """Current secret values, for the log redaction filter.
+
+    Covers file-supplied secrets as well as environment ones. A key read from a
+    file is not in the environment, so looking only there would leave exactly the
+    safer configuration unredacted -- the opposite of what it deserves.
+    """
     values = []
     for name in SECRET_ENV_VARS:
         value = os.environ.get(name, "").strip()
         if len(value) >= 4:  # too short to redact usefully, and not a real key
+            values.append(value)
+    for name in SECRET_FILE_ENV_VARS:
+        path = os.environ.get(name, "").strip()
+        if not path:
+            continue
+        try:
+            value = Path(path).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue  # unreadable is the api_key property's problem to report
+        if len(value) >= 4:
             values.append(value)
     return values

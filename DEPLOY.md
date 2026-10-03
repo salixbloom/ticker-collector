@@ -1,9 +1,16 @@
 # Deploying to Unraid with Dockge
 
-Dockge keeps each stack in its own directory and manages `compose.yaml` and `.env`
-there. This stack is built to suit that: put the repository in the stack
-directory, fill in `.env`, press Deploy. Compose builds the image itself, so there
-is no registry to push to and nothing to pull.
+Dockge keeps each stack in its own directory and gives you an editor for
+`compose.yaml`. This stack is built to suit that: **every setting lives in
+`compose.yaml`**, which is the file Dockge edits. Compose builds the image itself,
+so there is no registry to push to and nothing to pull.
+
+> **Why not `.env`?** Dockge treats `compose.yaml` as the stack's source of truth
+> and manages the stack directory around it, so a `.env` placed there can be
+> rewritten or cleared. Most settings would fall back to a sensible default and you
+> would never notice — but the API key has no default, so the collector would come
+> up *healthy*, register no jobs and silently collect nothing. The key therefore
+> comes from a file outside the stack directory, where nothing else manages it.
 
 ---
 
@@ -47,31 +54,45 @@ Copying over SMB works just as well — the directory needs `compose.yaml`,
 
 Dockge will now show **tick-collector** in its stack list.
 
-## 3. Fill in `.env`
+## 3. Put the API key in a file
 
-Open the stack in Dockge and edit `.env` (Dockge has an editor for it), or:
+Outside the stack directory, so nothing Dockge does can clear it:
 
 ```sh
-cp .env.example .env
+mkdir -p /mnt/user/appdata/tick-collector
+printf '%s' 'your-key-here' > /mnt/user/appdata/tick-collector/api_key
+chmod 600 /mnt/user/appdata/tick-collector/api_key
+chown 99:100 /mnt/user/appdata/tick-collector/api_key
 ```
 
-Only one value is required:
+`printf` rather than `echo` so no trailing newline is stored — though the
+collector strips whitespace either way. The file is mounted read-only at
+`/run/secrets/api_key` and read via `MASSIVE_API_KEY_FILE`; whatever it contains is
+redacted from logs exactly like an environment variable.
 
-```ini
-MASSIVE_API_KEY=your-key-here
+## 4. Check `compose.yaml`
+
+This is the file Dockge edits, and it carries every setting. Three things are
+worth a look before deploying; the rest can stay as shipped.
+
+```yaml
+    volumes:
+      - /mnt/user/appdata/tick-collector/api_key:/run/secrets/api_key:ro
+      - /mnt/user/quant-data:/data          # your data share
+    environment:
+      TZ: America/New_York
+      # COLLECTOR_ALERT_WEBHOOK: https://discord.com/api/webhooks/...
 ```
 
-Check these two match your share, then leave the rest alone:
+And the build args, which must match the owner of the data share:
 
-```ini
-COLLECTOR_DATA_DIR=/mnt/user/quant-data
-APP_UID=99
-APP_GID=100
+```yaml
+      args:
+        APP_UID: "99"
+        APP_GID: "100"
 ```
 
-`.env.example` documents every other setting; all have working defaults.
-
-## 4. Deploy
+## 5. Deploy
 
 Press **Deploy** in Dockge, or:
 
@@ -82,7 +103,7 @@ docker compose up -d
 The first deploy builds the image, which takes a few minutes (pyarrow and pandas
 are large). Subsequent deploys reuse it.
 
-## 5. Check it
+## 6. Check it
 
 ```sh
 docker exec tick-collector python -m collector doctor
@@ -100,7 +121,7 @@ authenticated. It prints a line per check and exits non-zero if anything failed:
 [  ok] atomic publish   published/, staging/, quarantine/ share a filesystem
 [  ok] disk space       1009.7 GB free
 [  ok] manifest         schema v4, 0 batch(es) recorded
-[  ok] api key          present in the environment
+[  ok] api key          present, from MASSIVE_API_KEY_FILE=/run/secrets/api_key
 [  ok] api reachable    api.massive.com reachable and authenticated
 [  ok] published files  0
 
@@ -173,13 +194,24 @@ docker exec tick-collector python -m collector history
 ```
 
 To finish a minute backfill faster, raise the per-run budget in
-`config/collector.toml` — 1,200 is conservative against the 7,200/day the rate
-limit actually allows:
+`config/collector.toml`:
 
 ```toml
 [collection]
-minute_calls_per_run = 5000
+minute_calls_per_run = 3000
 ```
+
+For a 1,000-ticker universe the chunked backfill is ~13,000 calls:
+
+| budget | run length | backfill |
+|---|---|---|
+| 1200 (default) | 4.0 h | ~11 nights |
+| 3000 | 10.0 h | ~5 nights |
+| 5000 | 16.7 h | ~3 nights |
+
+**Do not go much past 3,000.** Jobs run sequentially in one thread, so a job that
+takes 16.7 hours leaves the heartbeat untouched for that long and delays the 07:00
+EOD retry. At 3,000 the run ends around 05:15, before anything else is due.
 
 ## The provider's history window
 
@@ -253,14 +285,9 @@ docker exec tick-collector python -m collector minute --days 730 --chunk-days 40
 docker exec tick-collector python -m collector history
 ```
 
-To finish a minute backfill faster, raise the per-run budget in
-`config/collector.toml` — 1,200 is conservative against the 7,200/day the rate
-limit actually allows:
-
-```toml
-[collection]
-minute_calls_per_run = 5000
-```
+A manual run is bounded by `--max-calls`, not by `minute_calls_per_run` — that
+setting only governs the nightly job. See **What happens on first start** for how
+to size it.
 
 These share the container's rate limiter only if run inside it, as above. Don't
 run a second container against the same key — the 5 calls/minute limit is per key,
@@ -268,10 +295,11 @@ and two limiters would jointly exceed it.
 
 ## Alerting
 
-Set a webhook in `.env` and hard failures will reach you:
+Uncomment the webhook in `compose.yaml` and hard failures will reach you:
 
-```ini
-COLLECTOR_ALERT_WEBHOOK=https://discord.com/api/webhooks/...
+```yaml
+    environment:
+      COLLECTOR_ALERT_WEBHOOK: https://discord.com/api/webhooks/...
 ```
 
 The payload carries the message in both `text` and `content`, so one URL works
@@ -321,7 +349,7 @@ include_data = true   # false if an Unraid plugin already copies the array
 keep = 7
 ```
 
-Then mount it into the container in `compose.yaml`:
+Then uncomment the backup mount in `compose.yaml`:
 
 ```yaml
     volumes:
@@ -397,10 +425,10 @@ cd /mnt/user/appdata/dockge/stacks/tick-collector
 git pull
 ```
 
-Compose only rebuilds when the image tag changes, so bump it in `.env`:
+Compose only rebuilds when the image tag changes, so bump it in `compose.yaml`:
 
-```ini
-COLLECTOR_VERSION=0.2.0
+```yaml
+    image: tick-collector:0.2.0
 ```
 
 then Deploy again. Or force it:
@@ -415,9 +443,10 @@ docker compose up -d --build
 |---|---|
 | Container restarts repeatedly | Check `docker logs tick-collector`. A config error exits 2 with the reason on stderr. |
 | `cannot write to /data/...` | The share is not writable by `APP_UID:APP_GID`. The error names the uids involved. `chown 99:100` the host directory, or set `APP_UID`/`APP_GID` to match it and rebuild. |
-| Healthy but collecting nothing | `doctor`. Most likely no API key, in which case the log says so at startup and jobs are not registered at all. |
+| Healthy but collecting nothing | Almost always a missing API key: jobs are not registered at all and the log says so once at startup. `doctor` names the cause exactly — `is empty`, `could not be read`, or `no API key`. If you had put the key in a `.env` in the stack directory, check whether Dockge has cleared it, and move it to a key file as in step 3. |
 | `must be on one filesystem` | `published/`, `staging/` and `quarantine/` are split across mounts. Point `COLLECTOR_DATA_DIR` at a single share. |
 | Unhealthy in Dockge | `collector status` shows which job failed and why. Quarantined batches sit in `/data/quarantine/<batch>/` with a `check_report.json` explaining the rejection. |
+| `api key ... is empty` | The key file exists but has no contents. If it lives in the stack directory, Dockge may have rewritten it — move it to `/mnt/user/appdata/tick-collector/api_key` per step 3. |
 | `NOT_AUTHORIZED` / "plan doesn't include this data timeframe" | The date is older than the rolling window. Expected at the trailing edge, and handled: the collector learns the boundary and retires those dates. `collector history` shows it. If it is happening for *recent* dates, check the key. |
 | Minute days never publish | A day publishes only when every universe ticker is accounted for. `collector gaps --dataset minute` lists what is outstanding; a ticker that keeps failing is named there with its error. |
 | `no universe snapshot to collect against` | The minute job needs a universe, which derives from published EOD data. Run `collector universe` (or let the monthly slot do it) once EOD exists. |

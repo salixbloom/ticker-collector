@@ -50,6 +50,35 @@ The user must redeploy to pick that up.
 
 ## [DECISIONS]
 
+### Secrets under Dockge (2026-10-02)
+
+- 2026-10-02T21:00Z [USER] **Dockge has no `.env` editor** -- it edits
+  `compose.yaml`. I had claimed otherwise in `DEPLOY.md` and in several replies;
+  corrected throughout. The user also reported Dockge appearing to *clear* the
+  `.env` in the stack directory.
+- 2026-10-02T21:05Z [CODE] **Nothing is read from a `.env` in the stack
+  directory.** `compose.yaml` now carries literal values in `environment:`, since
+  that is the file Dockge edits and preserves. Removed `env_file:` and every
+  `${VAR}` interpolation: each one would have fallen back to its default on a
+  cleared `.env`, which is harmless for paths but silent for the API key -- the
+  one value with no default. The failure mode was a container that looked healthy,
+  registered no jobs and collected nothing.
+- 2026-10-02T21:05Z [CODE] **`MASSIVE_API_KEY_FILE`** reads the key from a file,
+  mounted read-only from outside the stack directory. The ``*_FILE`` convention is
+  the standard container pattern for this, and it puts the secret somewhere no
+  stack manager touches. The file wins over the environment variable, so a stale
+  env var cannot silently override deliberate configuration.
+- 2026-10-02T21:10Z [CODE] `secret_values()` reads the *contents* of
+  `*_FILE` paths too. Without that, a key supplied by file would have escaped the
+  log-redaction filter -- the safer configuration would have been the leaky one.
+  The path itself is not redacted, or every log line mentioning it would be
+  unreadable.
+- 2026-10-02T21:15Z [CODE] `doctor` reads the key rather than calling
+  `has_api_key()`, so it reports the real fault: `is empty`, `could not be read`,
+  or `no API key`. The distinction is the entire diagnostic when a stack manager
+  has rewritten the file; a generic "not set" would have sent the operator looking
+  in the wrong place.
+
 ### The provider's rolling history window (2026-10-02)
 
 - 2026-10-02T19:40Z [TOOL] **The plan serves a rolling ~730-day window, and EOD and
@@ -845,6 +874,10 @@ live runs rather than by tests.
 
 ## Follow-ups
 
+- [ ] **Move the API key to a file** outside the stack directory and redeploy:
+  `printf '%s' '<key>' > /mnt/user/appdata/tick-collector/api_key`. The shipped
+  `compose.yaml` already mounts and reads it. This is what stops Dockge clearing
+  the key and leaving the collector idle.
 - [ ] **Redeploy to pick up the history-window fix.** The running container has
   502,000 bogus owed minute ticker-days; on the first run after the upgrade the
   floor is discovered and they are retired in one write. The manifest migrates
