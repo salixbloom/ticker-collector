@@ -263,6 +263,7 @@ All times US Eastern, set by `[scheduler] timezone`:
 | 19:15 | `minute`            | Fill missing minute ticker-days |
 | 20:00 | `checks_report`     | Write the daily summary to `status.json` |
 | 21:00 | `backup`            | Verified backup, then prune the oldest |
+| 06:45 | `corporate_actions` (retry) | Clear a transient failure rather than wait a day |
 | 07:00 | `eod` (retry)       | Catch anything the provider published late |
 
 The order matters twice over: corporate actions run before EOD so the day's splits
@@ -423,25 +424,35 @@ docker exec tick-collector python -m collector burnin --journal /data/logs/burni
 ```sh
 cd /mnt/user/appdata/dockge/stacks/tick-collector
 git pull
-```
-
-Compose only rebuilds when the image tag changes, so bump it in `compose.yaml`:
-
-```yaml
-    image: tick-collector:0.2.0
-```
-
-then Deploy again. Or force it:
-
-```sh
 docker compose up -d --build
 ```
+
+**`--build` is not optional.** Dockge's Deploy button runs
+`docker compose up -d --remove-orphans`, and its Update button runs `pull` then the
+same thing; neither passes `--build`. Since `compose.yaml` pins
+`image: tick-collector:0.1.0`, Compose finds that tag already built locally and
+reuses it. So pressing Deploy after a `git pull` restarts the **old code** against
+the **new config** -- and because `config/` is a bind mount, the new config is live
+immediately. A setting added in the same commit as the code that reads it then
+looks like a config error:
+
+```
+[collection]: unknown key(s) ['history_safety_days']; ...
+```
+
+Nothing is wrong with the config; the image predates it. Rebuild and it starts.
+
+Dockge has a terminal (the `>_` icon on the stack), so the three commands above can
+be run without leaving the UI. Bumping the tag in `compose.yaml` works too -- a tag
+Compose has never built forces a build -- but it means editing a version on every
+pull, so prefer `--build`.
 
 ## When something is wrong
 
 | Symptom | Cause and fix |
 |---|---|
 | Container restarts repeatedly | Check `docker logs tick-collector`. A config error exits 2 with the reason on stderr. |
+| `unknown key(s) [...]` in `[section]` | The image is older than the config file, almost always a `git pull` without a rebuild. The message names the build it came from. Fix with `docker compose up -d --build` -- see [Updating](#updating). (A genuine typo in `config/collector.toml` gives the same error; the message lists the keys that section does accept.) |
 | `cannot write to /data/...` | The share is not writable by `APP_UID:APP_GID`. The error names the uids involved. `chown 99:100` the host directory, or set `APP_UID`/`APP_GID` to match it and rebuild. |
 | Healthy but collecting nothing | Almost always a missing API key: jobs are not registered at all and the log says so once at startup. `doctor` names the cause exactly — `is empty`, `could not be read`, or `no API key`. If you had put the key in a `.env` in the stack directory, check whether Dockge has cleared it, and move it to a key file as in step 3. |
 | `must be on one filesystem` | `published/`, `staging/` and `quarantine/` are split across mounts. Point `COLLECTOR_DATA_DIR` at a single share. |

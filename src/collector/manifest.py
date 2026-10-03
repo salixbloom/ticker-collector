@@ -164,6 +164,31 @@ class CoverageGap:
     last_error: str | None = None
 
 
+_COVERAGE_UPSERT = """
+    INSERT INTO coverage (
+        dataset, day, ticker, state, attempts, last_batch, last_error, updated_at
+    ) VALUES (?,?,?,?,?,?,?,?)
+    ON CONFLICT(dataset, day, ticker) DO UPDATE SET
+        state=excluded.state,
+        attempts=coverage.attempts + ?,
+        last_batch=excluded.last_batch,
+        last_error=excluded.last_error,
+        updated_at=excluded.updated_at
+"""
+
+
+@dataclass(frozen=True)
+class CoverageMark:
+    """One unit's outcome, for writing a batch of them in one transaction."""
+
+    day: date
+    state: str
+    ticker: str = ""
+    batch_id: str | None = None
+    error: str | None = None
+    increment_attempt: bool = True
+
+
 @dataclass
 class Manifest:
     """Connection wrapper around ``state/manifest.sqlite``."""
@@ -372,31 +397,65 @@ class Manifest:
         increment_attempt: bool = True,
     ) -> None:
         """Set the state of one unit of work."""
-        with self.transaction() as conn:
-            conn.execute(
-                """
-                INSERT INTO coverage (
-                    dataset, day, ticker, state, attempts, last_batch, last_error, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(dataset, day, ticker) DO UPDATE SET
-                    state=excluded.state,
-                    attempts=coverage.attempts + ?,
-                    last_batch=excluded.last_batch,
-                    last_error=excluded.last_error,
-                    updated_at=excluded.updated_at
-                """,
-                (
-                    dataset,
-                    day.isoformat(),
-                    ticker,
-                    state,
-                    1 if increment_attempt else 0,
-                    batch_id,
-                    error,
-                    _iso(utcnow()),
-                    1 if increment_attempt else 0,
-                ),
+        self.mark_coverage_many(
+            dataset,
+            [
+                CoverageMark(
+                    day=day,
+                    state=state,
+                    ticker=ticker,
+                    batch_id=batch_id,
+                    error=error,
+                    increment_attempt=increment_attempt,
+                )
+            ],
+        )
+
+    def mark_coverage_many(self, dataset: str, marks: Sequence[CoverageMark]) -> None:
+        """Set many units' states in ONE transaction.
+
+        ``synchronous=FULL`` means every commit fsyncs, so marking a backfill
+        chunk's ticker-days one at a time costs one fsync each -- 40 per API call
+        at ``minute_backfill_chunk_days = 40``, ~48,000 per run at the deployed
+        call budget, on an array-backed share where an fsync is not cheap.
+        """
+        if not marks:
+            return
+        now = _iso(utcnow())
+        rows = [
+            (
+                dataset,
+                mark.day.isoformat(),
+                mark.ticker,
+                mark.state,
+                1 if mark.increment_attempt else 0,
+                mark.batch_id,
+                mark.error,
+                now,
+                1 if mark.increment_attempt else 0,
             )
+            for mark in marks
+        ]
+        with self.transaction() as conn:
+            conn.executemany(_COVERAGE_UPSERT, rows)
+
+    def outstanding_by_day(self, dataset: str) -> dict[date, int]:
+        """How many units each day still owes, in one query.
+
+        The caller that needs this asks it for every day in the window, and the
+        obvious spelling -- filter the full gap list per day -- is quadratic. At
+        ~500 days against ~460,000 outstanding ticker-days that was 20 minutes of
+        a run spent building dataclasses to throw away.
+        """
+        rows = self.conn.execute(
+            """
+            SELECT day, COUNT(*) AS n FROM coverage
+             WHERE dataset = ? AND state IN (?, ?)
+             GROUP BY day
+            """,
+            (dataset, PENDING, FAILED),
+        )
+        return {date.fromisoformat(row["day"]): row["n"] for row in rows}
 
     def gaps(
         self,

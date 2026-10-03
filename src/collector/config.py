@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from . import __version__
+
 DEFAULT_CONFIG_PATH = Path("/app/config/collector.toml")
 
 #: Environment variables holding secrets. Their values are redacted from logs.
@@ -247,7 +249,12 @@ def _build(cls: type, values: dict[str, Any], section: str):
     known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
     unknown = set(values) - known
     if unknown:
-        raise ConfigError(f"[{section}]: unknown key(s) {sorted(unknown)}; known: {sorted(known)}")
+        raise ConfigError(
+            f"[{section}]: unknown key(s) {sorted(unknown)}; known: {sorted(known)}. "
+            f"This build is collector {__version__}; if the key exists in the config you just "
+            "pulled, the running image is older than the config file -- rebuild it with "
+            "`docker compose up -d --build` (Deploy alone does not rebuild)."
+        )
     return cls(**values)
 
 

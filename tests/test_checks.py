@@ -102,6 +102,20 @@ def test_hard_non_trading_day_weekend(ctx):
     assert rules.check_is_trading_day(WEEKEND, CAL).is_hard
 
 
+def test_the_trading_day_check_does_not_apply_to_cumulative_tables(ctx):
+    """Splits and dividends are dated by when they were fetched, not by a session.
+
+    Their rows carry their own execution and ex-dividend dates. Checking the
+    batch date against the calendar made a weekend fetch of perfectly good data a
+    hard failure -- which is exactly what took the deployed container unhealthy
+    every Saturday.
+    """
+    assert "splits" not in checks.SESSION_DATED
+    assert "dividends" not in checks.SESSION_DATED
+    for dataset in checks.SESSION_DATED:
+        assert dataset in ("eod", "minute", "tickers", "universe")
+
+
 def test_hard_non_trading_day_holiday():
     """Thanksgiving 2026-11-26 is a holiday, so data for it cannot be real."""
     finding = rules.check_is_trading_day(HOLIDAY, CAL)

@@ -37,7 +37,20 @@ TODAY = date(2026, 9, 30)
 # --------------------------------------------------------------------------- #
 
 
-def make_ctx(tmp_path, handler) -> jobs.Context:
+class AlwaysOpen(TradingCalendar):
+    """A calendar with no weekends, for tests about failure handling.
+
+    `run_reference` only ever snapshots *today*, so a test that drives it through
+    the real clock silently stops testing anything over a weekend: the job
+    short-circuits with "not a trading day" and reports ok. The container runs in
+    UTC, so that starts at 20:00 ET on Friday.
+    """
+
+    def is_trading_day(self, day: date) -> bool:
+        return True
+
+
+def make_ctx(tmp_path, handler, *, calendar: TradingCalendar | None = None) -> jobs.Context:
     config = Config(
         data_root=tmp_path / "data",
         source=SourceConfig(base_url="https://api.massive.com", calls_per_minute=10_000),
@@ -55,7 +68,7 @@ def make_ctx(tmp_path, handler) -> jobs.Context:
         client=client,
         manifest=Manifest(paths.manifest_db),
         paths=paths,
-        calendar=TradingCalendar(),
+        calendar=calendar or TradingCalendar(),
     )
 
 
@@ -94,7 +107,7 @@ def test_the_jobs_run_at_the_times_the_plan_specifies(ctx):
     _register_jobs(scheduler, ctx)
     slots = {job.name: job.at for job in scheduler.jobs}
     assert slots["reference"] == (time(18, 0),)
-    assert slots["corporate_actions"] == (time(18, 15),)
+    assert slots["corporate_actions"] == (time(18, 15), time(6, 45))
     assert slots["eod"] == (time(18, 30), time(7, 0))  # evening plus a morning retry
     assert slots["universe"] == (time(19, 0),)
     assert slots["minute"] == (time(19, 15),)
@@ -129,6 +142,22 @@ def test_corporate_actions_run_before_eod(ctx):
     assert at["corporate_actions"] < at["eod"]
 
 
+def test_corporate_actions_is_retried_before_eod_the_next_morning(ctx):
+    """Both jobs get a morning slot, and the ordering has to hold there too.
+
+    A transient failure at 18:15 otherwise leaves the container unhealthy for a
+    full day, re-alerting on every cooldown, with no retry to clear it.
+    """
+    scheduler = Scheduler()
+    _register_jobs(scheduler, ctx)
+    at = {job.name: sorted(job.at) for job in scheduler.jobs}
+    assert len(at["corporate_actions"]) == 2, "a failed fetch must get another attempt"
+    morning_actions, evening_actions = at["corporate_actions"]
+    morning_eod, evening_eod = at["eod"]
+    assert morning_actions < morning_eod
+    assert evening_actions < evening_eod
+
+
 def test_a_scheduled_job_writes_status_when_it_runs(ctx):
     scheduler = Scheduler()
     _register_jobs(scheduler, ctx)
@@ -146,7 +175,7 @@ def test_a_failing_job_does_not_take_the_container_down(tmp_path, monkeypatch):
     def broken(_request):
         return httpx.Response(500)
 
-    ctx = make_ctx(tmp_path, broken)
+    ctx = make_ctx(tmp_path, broken, calendar=AlwaysOpen())
     try:
         scheduler = Scheduler()
         _register_jobs(scheduler, ctx)

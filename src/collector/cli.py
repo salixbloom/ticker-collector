@@ -368,7 +368,7 @@ def _register_jobs(
     """Register the collection jobs, on the plan's schedule (US Eastern).
 
         reference          18:00                        (M5)
-        corporate_actions  18:15                        (M5)
+        corporate_actions  18:15, retry 06:45 next day  (M5)
         eod                18:30, retry 07:00 next day  (M4)
         universe           19:00, monthly               (M6)
         minute             19:15, runs until done       (M7)
@@ -411,10 +411,15 @@ def _register_jobs(
         return run
 
     scheduler.every_day_at("reference", scheduled("reference", jobs.run_reference), dtime(18, 0))
+    # Retried at 06:45 for the same reason EOD is retried at 07:00, and 15
+    # minutes ahead of it so the ordering below holds at both slots. Without a
+    # retry a transient failure at 18:15 leaves the container reporting unhealthy
+    # for 24 hours, re-alerting every cooldown, with nothing to do but wait.
     scheduler.every_day_at(
         "corporate_actions",
         scheduled("corporate_actions", jobs.run_corporate_actions),
         dtime(18, 15),
+        dtime(6, 45),
     )
     scheduler.every_day_at("eod", scheduled("eod", jobs.run_eod), dtime(18, 30), dtime(7, 0))
     # Monthly, and before the minute job, so a rebuilt universe takes effect the

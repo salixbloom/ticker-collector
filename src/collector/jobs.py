@@ -154,6 +154,28 @@ def history_floor(ctx: Context, dataset: str, *, today: date) -> date:
 PROBE_TICKER = "AAPL"
 
 
+def retire_aged_out(ctx: Context, dataset: str, *, today: date) -> int:
+    """Retire units that slid out of the window while they were still owed.
+
+    The provider's window is rolling, so the oldest date worth asking for moves
+    forward every day. Both bar jobs bound their work by ``history_floor``, which
+    means a unit left pending or failed below the new edge is never worked again
+    -- but it stays in ``gaps()``, and so in the "still owed" figure the operator
+    is meant to act on. During a long backfill that figure would drift further
+    from the truth every day: ~1,000 minute ticker-days fall below the edge per
+    trading day and would accumulate as permanent phantoms.
+
+    ``note_unauthorized`` retires in the same way, but only when the provider
+    actually refuses a date. This is the half that has no refusal to trigger it:
+    the edge simply moved.
+    """
+    floor = history_floor(ctx, dataset, today=today)
+    retired = ctx.manifest.retire_before(dataset, floor, AGED_OUT)
+    if retired:
+        log.info("%s: retired %d unit(s) that aged out below %s", dataset, retired, floor)
+    return retired
+
+
 def note_unauthorized(ctx: Context, dataset: str, day: date, *, today: date) -> int:
     """Learn the provider's real window edge, then retire everything below it.
 
@@ -241,6 +263,7 @@ def run_eod(
     result = JobResult(job="eod", run_id=run_id)
     ctx.manifest.start_run(run_id, "eod")
 
+    result.skipped += retire_aged_out(ctx, "eod", today=today)
     expected = expected_eod_days(ctx, today=today, backfill_days=backfill_days)
     ctx.manifest.expect("eod", expected)
     expected_set = set(expected)
@@ -499,6 +522,44 @@ def run_reference(ctx: Context, *, today: date | None = None) -> JobResult:
     return result
 
 
+def _retire_superseded_actions(ctx: Context, dataset: str, today: date) -> int:
+    """Stop reporting past corporate-action failures as owed work.
+
+    Unlike the bar datasets these are not fetched per day: every run asks for one
+    lookback window ending today. So nothing will ever retry the day a fetch
+    failed on -- it is either re-covered by this run (the normal case, because the
+    window overlaps) or permanently missed. Leaving the row pending would report a
+    gap on every run forever, which is what made `1 still owed` outlive the
+    failure that caused it.
+
+    Called only after a fetch has actually succeeded, so a run that fails too
+    leaves yesterday's failure on the books.
+    """
+    cutoff = today - timedelta(days=CORPORATE_ACTION_LOOKBACK_DAYS)
+    retired = 0
+    for gap in [g for g in ctx.manifest.gaps(dataset) if g.day < today]:
+        covered = gap.day >= cutoff
+        ctx.manifest.mark_coverage(
+            dataset,
+            gap.day,
+            manifest_module.SKIPPED,
+            error=ACTIONS_SUPERSEDED if covered else ACTIONS_MISSED,
+            increment_attempt=False,
+        )
+        retired += 1
+        if not covered:
+            log.warning(
+                "corporate_actions: %s %s was never collected and is now outside the "
+                "%d-day lookback; revisions for that date are missing",
+                dataset,
+                gap.day,
+                CORPORATE_ACTION_LOOKBACK_DAYS,
+            )
+    if retired:
+        log.info("corporate_actions: %s: retired %d past day(s) no longer owed", dataset, retired)
+    return retired
+
+
 def _retire_unreachable_snapshots(ctx: Context, today: date) -> None:
     """Mark past reference days as permanently skipped rather than owed.
 
@@ -529,6 +590,13 @@ def _retire_unreachable_snapshots(ctx: Context, today: date) -> None:
 #: would never see a correction to one already recorded.
 CORPORATE_ACTION_LOOKBACK_DAYS = 90
 
+#: Reasons recorded against corporate-action days that are no longer owed.
+ACTIONS_SUPERSEDED = "superseded by a later fetch whose lookback covered this date"
+ACTIONS_MISSED = (
+    "older than the corporate-action lookback when the next fetch succeeded; "
+    "revisions published for this date were never collected"
+)
+
 
 def run_corporate_actions(ctx: Context, *, today: date | None = None) -> JobResult:
     """Fetch new and revised splits and dividends into cumulative tables.
@@ -541,6 +609,14 @@ def run_corporate_actions(ctx: Context, *, today: date | None = None) -> JobResu
     run_id = f"corpactions-{uuid.uuid4().hex[:12]}"
     result = JobResult(job="corporate_actions", run_id=run_id)
     ctx.manifest.start_run(run_id, "corporate_actions")
+
+    # Consistent with the other two reference jobs, which skip non-trading days
+    # rather than record one. The lookback window is 90 days, so anything
+    # announced or revised over a weekend arrives with Monday's run.
+    if not ctx.calendar.is_trading_day(today):
+        log.info("corporate_actions: %s is not a trading day, nothing to fetch", today)
+        ctx.manifest.finish_run(run_id, "ok", {"reason": "not a trading day"})
+        return result
 
     since = today - timedelta(days=CORPORATE_ACTION_LOOKBACK_DAYS)
     plan = (
@@ -588,6 +664,9 @@ def run_corporate_actions(ctx: Context, *, today: date | None = None) -> JobResu
             result.rows += outcome.rows
             result.soft_flags.extend(f"{dataset}: {f.message}" for f in outcome.report.soft_flags)
             log.info("corporate_actions: %s %d row(s) in batch", dataset, outcome.rows)
+            # This fetch covered the lookback window, so an earlier day left
+            # pending or failed is not work anyone will do again.
+            result.skipped += _retire_superseded_actions(ctx, dataset, today)
         else:
             result.quarantined += 1
             result.quarantine_reasons.append(f"{dataset}: {outcome.report.summary()}")
@@ -678,6 +757,7 @@ def run_minute(
     result = JobResult(job="minute", run_id=run_id)
     ctx.manifest.start_run(run_id, "minute")
 
+    result.skipped += retire_aged_out(ctx, "minute", today=today)
     days = expected_minute_days(ctx, today=today, backfill_days=backfill_days)
     if not days:
         log.info("minute: no expected trading days in the window")
@@ -715,14 +795,18 @@ def run_minute(
         calls = _collect_minute_daily(ctx, result, days, max_calls, run_id, set(working), today)
 
     # Publish any day that is now complete, including ones finished by an earlier
-    # interrupted run.
+    # interrupted run. One grouped count for the lot: asking per day is quadratic
+    # in the number of outstanding ticker-days, which during a backfill is most
+    # of half a million.
+    outstanding = ctx.manifest.outstanding_by_day("minute")
     for day in days:
-        if _minute_day_outstanding(ctx, day):
+        if outstanding.get(day):
             continue
         if ctx.manifest.latest_published("minute", day) is not None:
             continue
         _publish_minute_day(ctx, result, day, run_id=run_id)
 
+    remaining = sum(ctx.manifest.outstanding_by_day("minute").values())
     ctx.manifest.finish_run(
         run_id,
         result.outcome,
@@ -730,14 +814,14 @@ def run_minute(
             "calls": calls,
             "published_days": result.published,
             "quarantined": result.quarantined,
-            "ticker_days_remaining": len(ctx.manifest.gaps("minute")),
+            "ticker_days_remaining": remaining,
         },
     )
     log.info(
         "minute: %d call(s), %d day(s) published, %d ticker-day(s) still owed",
         calls,
         result.published,
-        len(ctx.manifest.gaps("minute")),
+        remaining,
     )
     return result
 
@@ -750,11 +834,6 @@ def expected_minute_days(
     end = today - timedelta(days=1)
     start = max(end - timedelta(days=window), history_floor(ctx, "minute", today=today))
     return ctx.calendar.trading_days(start, end)
-
-
-def _minute_day_outstanding(ctx: Context, day: date) -> int:
-    """Ticker-days still owed for one day."""
-    return len([g for g in ctx.manifest.gaps("minute") if g.day == day])
 
 
 def _collect_minute_daily(
@@ -917,17 +996,22 @@ def _fetch_minute_range(
             by_day[local_day].append(row)
 
     floor = ctx.manifest.history_floor("minute")
+    # One transaction for the whole chunk. `synchronous=FULL` fsyncs on every
+    # commit, so marking 40 ticker-days individually meant 40 fsyncs per API call
+    # -- tens of thousands per run, on an Unraid share where that is not free.
+    marks: list[manifest_module.CoverageMark] = []
     for day, rows in by_day.items():
         if not rows:
             # A range straddling the window edge returns OK and silently clips, so
             # an empty day below the floor is aged out rather than simply quiet.
             aged_out = floor is not None and day < floor
-            ctx.manifest.mark_coverage(
-                "minute",
-                day,
-                manifest_module.SKIPPED,
-                ticker=ticker,
-                error=AGED_OUT if aged_out else "no bars returned for this ticker-day",
+            marks.append(
+                manifest_module.CoverageMark(
+                    day=day,
+                    state=manifest_module.SKIPPED,
+                    ticker=ticker,
+                    error=AGED_OUT if aged_out else "no bars returned for this ticker-day",
+                )
             )
             continue
         parsed = parse.minute(
@@ -939,12 +1023,13 @@ def _fetch_minute_range(
             include_extended_hours=ctx.config.collection.extended_hours,
         )
         if parsed.table.num_rows == 0:
-            ctx.manifest.mark_coverage(
-                "minute",
-                day,
-                manifest_module.SKIPPED,
-                ticker=ticker,
-                error="all bars fell outside the session window",
+            marks.append(
+                manifest_module.CoverageMark(
+                    day=day,
+                    state=manifest_module.SKIPPED,
+                    ticker=ticker,
+                    error="all bars fell outside the session window",
+                )
             )
             continue
         part = ctx.paths.minute_part(day, ticker)
@@ -955,9 +1040,15 @@ def _fetch_minute_range(
             compression_level=ctx.compression_level,
             row_group_bytes=ctx.row_group_bytes,
         )
-        ctx.manifest.mark_coverage(
-            "minute", day, manifest_module.OK, ticker=ticker, batch_id=run_id
+        marks.append(
+            manifest_module.CoverageMark(
+                day=day, state=manifest_module.OK, ticker=ticker, batch_id=run_id
+            )
         )
+
+    # After the parts are on disk: a crash between the two re-fetches the chunk,
+    # which is one call, where the reverse would record data that is not there.
+    ctx.manifest.mark_coverage_many("minute", marks)
 
 
 def _publish_minute_day(ctx: Context, result: JobResult, day: date, *, run_id: str) -> None:

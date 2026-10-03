@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from collector import __version__
 from collector.config import Config, ConfigError, load, secret_values
 
 SAMPLE = """
@@ -70,10 +71,34 @@ def test_invalid_toml_is_an_error(tmp_path):
         load(write_config(tmp_path, "this is not = = toml"))
 
 
+TYPO_CONFIG = """[storage]
+compresion_level = 9
+"""
+
+
 def test_a_typo_in_a_key_fails_loudly(tmp_path):
     """Silently ignoring it would mean running with an unintended default."""
     with pytest.raises(ConfigError, match="unknown key"):
         load(write_config(tmp_path, "[storage]\ncompresion_level = 9\n"))
+
+
+def test_unknown_key_error_names_the_section_and_the_accepted_keys(tmp_path):
+    with pytest.raises(ConfigError) as excinfo:
+        load(write_config(tmp_path, TYPO_CONFIG))
+    message = str(excinfo.value)
+    assert "[storage]" in message
+    assert "compresion_level" in message
+    assert "compression_level" in message  # the key they meant, from `known:`
+
+
+def test_unknown_key_error_points_at_a_stale_image(tmp_path):
+    """The other cause of this error is a container older than its bind-mounted
+    config -- it looks identical but is not a config fault at all."""
+    with pytest.raises(ConfigError) as excinfo:
+        load(write_config(tmp_path, TYPO_CONFIG))
+    message = str(excinfo.value)
+    assert __version__ in message
+    assert "--build" in message
 
 
 @pytest.mark.parametrize(

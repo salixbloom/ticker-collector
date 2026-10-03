@@ -535,3 +535,66 @@ def test_chunking_costs_no_extra_calls_in_steady_state(tmp_path):
     finally:
         ctx.client.close()
         ctx.manifest.close()
+
+
+# --------------------------------------------------------------------------- #
+# The edge moving on its own
+# --------------------------------------------------------------------------- #
+
+
+def test_a_day_that_ages_out_stops_being_reported_as_owed(ctx):
+    """The leak this closes: no refusal is involved, the window just slid.
+
+    Both bar jobs bound their work by `history_floor`, so a unit left pending
+    below it is never worked again -- but it stayed in `gaps()` and so in the
+    "still owed" figure. Over a month-long backfill that figure drifts further
+    from the truth every day.
+    """
+    floor = jobs.history_floor(ctx, "eod", today=TODAY)
+    aged_out = floor - timedelta(days=30)
+    ctx.manifest.expect("eod", [aged_out])
+    assert [g.day for g in ctx.manifest.gaps("eod")] == [aged_out]
+
+    retired = jobs.retire_aged_out(ctx, "eod", today=TODAY)
+
+    assert retired == 1
+    assert ctx.manifest.gaps("eod") == [], "nothing will ever fill it, so it is not owed"
+    summary = ctx.manifest.coverage_summary("eod")
+    assert summary.get(manifest_module.SKIPPED) == 1
+    row = ctx.manifest.conn.execute(
+        "SELECT last_error FROM coverage WHERE dataset = 'eod' AND day = ?",
+        (aged_out.isoformat(),),
+    ).fetchone()
+    assert "history window" in row["last_error"], "and the record says why"
+
+
+def test_retiring_aged_out_units_leaves_the_reachable_ones_alone(ctx):
+    floor = jobs.history_floor(ctx, "eod", today=TODAY)
+    reachable = CAL.trading_days(floor, floor + timedelta(days=10))[:3]
+    ctx.manifest.expect("eod", [floor - timedelta(days=1), *reachable])
+
+    assert jobs.retire_aged_out(ctx, "eod", today=TODAY) == 1
+    assert [g.day for g in ctx.manifest.gaps("eod")] == reachable
+
+
+def test_an_aged_out_minute_ticker_day_is_retired_without_an_api_call(ctx):
+    """One UPDATE for the lot -- a thousand tickers a day cannot each cost a call."""
+    floor = jobs.history_floor(ctx, "minute", today=TODAY)
+    dead = floor - timedelta(days=7)
+    ctx.manifest.expect("minute", [dead], tickers=["AAPL", "MSFT", "NVDA"])
+    before = len(ctx.api.calls)  # type: ignore[attr-defined]
+
+    assert jobs.retire_aged_out(ctx, "minute", today=TODAY) == 3
+    assert ctx.manifest.gaps("minute") == []
+    assert len(ctx.api.calls) == before  # type: ignore[attr-defined]
+
+
+def test_the_minute_job_sweeps_aged_out_ticker_days_as_it_runs(ctx):
+    """So the owed figure in the daily report converges instead of drifting."""
+    floor = jobs.history_floor(ctx, "minute", today=TODAY)
+    dead = floor - timedelta(days=14)
+    ctx.manifest.expect("minute", [dead], tickers=["AAPL"])
+
+    jobs.run_minute(ctx, today=TODAY, max_calls=0, chunk_days=40)
+
+    assert not [g for g in ctx.manifest.gaps("minute") if g.day == dead]

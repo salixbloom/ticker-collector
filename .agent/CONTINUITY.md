@@ -915,3 +915,101 @@ live runs rather than by tests.
   means a first start begins collecting ~2 minutes in; with the shipped
   `backfill_days = 730` that is ~100 minutes of EOD plus ~15 for the first
   reference snapshot.
+
+[DECISIONS] Rebuilding after a pull (2026-10-03)
+- Dockge's Deploy runs `docker compose up -d --remove-orphans` and Update runs
+  `pull` then the same; neither passes `--build` (verified in louislam/dockge
+  backend/stack.ts). With `image: tick-collector:0.1.0` pinned in compose.yaml,
+  Compose reuses the already-built tag, so Deploy after `git pull` runs the OLD
+  code against the NEW config -- and config/ is a bind mount, so the config is
+  live at once. A setting added in the same commit as the code that reads it then
+  surfaces as `[collection]: unknown key(s) ['history_safety_days']`, which blames
+  the config for an image problem.
+- The unknown-key ConfigError now names the build it came from and points at
+  `docker compose up -d --build`. DEPLOY.md's Updating section makes `--build`
+  mandatory rather than an aside, and the troubleshooting table has a row for it.
+- Kept the pinned tag: it makes `docker images` honest about what is running. The
+  alternative (dropping `image:`) would not trigger rebuilds either.
+
+[CODE] tests/test_deployment.py AlwaysOpen calendar (2026-10-03)
+- `run_reference` only snapshots *today*, so driving it through the real clock
+  stops testing anything over a weekend -- it short-circuits "not a trading day"
+  and reports ok. Caught live: the suite went green at 17:30 PDT Friday and red at
+  00:32 UTC Saturday, same code. Any future test that runs a scheduled job through
+  `job.fn()` needs a pinned date or this stub.
+
+[CODE] Owed-count leaks closed (2026-10-03)
+- `jobs.retire_aged_out(ctx, dataset, today=)` runs at the top of `run_eod` and
+  `run_minute`. Both bound their work by `history_floor`, so a unit left pending
+  or failed below the (daily-advancing) configured floor was never worked again
+  yet stayed in `gaps()`. On the deployed container that was already visible as
+  `eod: failed=1 (1 still owed)` alongside `eod: 0 gap(s) to fill`, and during
+  the minute backfill it would have grown by ~1,000 phantom ticker-days per
+  trading day. `note_unauthorized` retires on a refusal; this is the half where
+  the edge just moved and there is no refusal to trigger it.
+- `_retire_superseded_actions` does the same for splits/dividends, which are
+  fetched as one lookback window ending today and so never retry a past day.
+  Called ONLY after a successful publish -- retirement asserts the data was
+  recovered, and only a success can assert that. Days older than the 90-day
+  lookback get a different reason (ACTIONS_MISSED) and a warning, because
+  revisions for them genuinely were lost.
+- corporate_actions now also runs at 06:45, mirroring eod's 07:00 retry and
+  staying 15m ahead of it so "splits before the large-move check" holds at both
+  slots. Without it one transient 500 left the container unhealthy for 24h,
+  re-alerting every cooldown, with no retry able to clear it.
+
+[OPEN] Minute run wall-clock is ~2.4x its call budget (2026-10-03)
+- Deployed run: 1,200 calls took 19:15->04:34 (9h20m). At 5 calls/min the budget
+  implies ~4h. The retry-backoff explanation first written here is WRONG: the
+  gaps output showed every failure at attempts=1 and none being retried.
+- Still unexplained: ~5h. Candidates, in order of suspicion, both now reduced but
+  not measured: ~48,000 individual SQLite commits per run (fsync each, on a FUSE
+  user share) and ~48,000 small work-part parquet writes to the array. The
+  quadratic publish scan accounts for the 20-minute tail, not the 5 hours.
+- To settle it, compare the next run's wall clock after the batching change. If
+  it is still far above 4h, the remaining cost is the work-part writes, and
+  work/ belongs on the cache SSD (only staging->published must share a
+  filesystem; work/ is scratch read back at merge time).
+- So `minute_calls_per_run` does NOT bound run duration, which is what it exists
+  for. Do not raise it to 3000 until the failure rate is understood -- that would
+  be ~24h and would collide with the next slot (jobs run sequentially in the
+  scheduler thread).
+- Next step is the user's `collector gaps --dataset minute` output: it prints
+  last_error per ticker-day, which says whether these are provider 500s or
+  PartialResponse at the 50,000-bar cap. Do not guess between those.
+
+[DECISIONS] corporate_actions failed every weekend (2026-10-03)
+- Live evidence: `gaps --dataset splits` showed `2026-10-03 failed ... 2026-10-03
+  is not a trading day on NYSE`. NOT the transient failure assumed one turn
+  earlier -- it is deterministic. `checks.run` applied `check_is_trading_day` to
+  every dataset, but splits/dividends are cumulative tables dated by WHEN THEY
+  WERE FETCHED; their rows carry their own execution/ex-dividend dates. A
+  Saturday fetch of good data was therefore a hard failure, taking container
+  health down every weekend (and on any weekend restart, via catch_up_on_start).
+- Fix is two-part: `checks.SESSION_DATED = ("eod","minute","tickers","universe")`
+  gates the check, and `run_corporate_actions` now skips non-trading days like
+  `run_reference`/`run_universe` already did. Nothing is lost -- the 90-day
+  lookback picks up weekend announcements on Monday.
+- Note for future me: when a test date lands on a weekend and the test fails, ask
+  whether the code or the date is wrong. I first "fixed" the retirement test by
+  moving it to a weekday, which hid this bug rather than finding it.
+
+[DECISIONS] The 1,315 failed minute ticker-days were debris (2026-10-03)
+- All on 2024-09-30, all `attempts=1`, all 403 NOT_AUTHORIZED. 2024-09-30 is
+  exactly `2026-09-30 - 730 days`: the floor the PRE-FIX code used on the
+  container's first night, with no safety margin. Today's floor is 2024-10-08, so
+  nothing has retried them since -- which is why attempts never went past 1.
+- So `retire_aged_out` (added this session) clears them on the next minute run,
+  with no API calls. No further action.
+- This also disproves the retry-backoff explanation offered for the 9h20m run:
+  nothing is retrying. See the OPEN entry below.
+
+[CODE] Minute-path cost reductions (2026-10-03)
+- `manifest.mark_coverage_many` + `CoverageMark`: one transaction for a whole
+  backfill chunk. `synchronous=FULL` fsyncs per commit, so 40 individual marks
+  per API call meant ~48,000 fsyncs per run on an Unraid user share.
+  `mark_coverage` is now a one-element call into it.
+- `manifest.outstanding_by_day` (one GROUP BY) replaces `_minute_day_outstanding`,
+  which materialised all ~460,000 gap rows once per day in the publish loop --
+  ~500 x 460,000 dataclass constructions, and the likely content of the 20-minute
+  gap between "call budget reached" (04:34) and "minute finished" (04:54).

@@ -60,13 +60,25 @@ class CheckContext:
     eod_table: pa.Table | None = None
 
 
+#: Datasets whose batch date is a trading session, and so must be one. The rest
+#: are dated by the calendar day they were collected on.
+SESSION_DATED = ("eod", "minute", "tickers", "universe")
+
+
 def run(table: pa.Table, dataset: str, batch_id: str, context: CheckContext) -> CheckReport:
     """Run every check that applies to this batch."""
     report = CheckReport(dataset=dataset, batch_id=batch_id)
 
     # Structural. The schema, nullability and read-back checks already ran in
     # storage.stage(); these are the ones that need the dataset's semantics.
-    _record(report, "is_trading_day", rules.check_is_trading_day(context.day, context.calendar))
+    # Splits and dividends are cumulative tables dated by *when they were
+    # fetched*, not by a session -- the rows carry their own execution and
+    # ex-dividend dates, as the comment below says. Checking the batch date
+    # against the calendar made a Saturday fetch of perfectly good data a hard
+    # failure, which on the deployed container meant corporate_actions failing
+    # every weekend and taking container health down with it.
+    if dataset in SESSION_DATED:
+        _record(report, "is_trading_day", rules.check_is_trading_day(context.day, context.calendar))
     _record(report, "no_duplicate_keys", rules.check_no_duplicate_keys(table, dataset))
 
     # Only the bar datasets carry a per-row timestamp to bound. A ticker snapshot

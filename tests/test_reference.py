@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 
 import httpx
 import pyarrow as pa
@@ -653,3 +653,128 @@ def test_a_clean_reference_run_passes_every_applicable_check(ctx):
     # The bar-only checks are skipped rather than crashing on absent columns.
     assert "timestamps_in_window" not in report.passed
     assert "snapshot_date" in report.passed
+
+
+# --------------------------------------------------------------------------- #
+# A corporate-action fetch that failed yesterday
+# --------------------------------------------------------------------------- #
+
+
+def test_a_failed_corporate_action_day_stops_being_owed_once_a_later_fetch_succeeds(tmp_path):
+    """Nothing retries the day itself, so leaving it pending reports it forever.
+
+    Every run asks for one lookback window ending today. The failed day's data
+    therefore arrives with the next successful run anyway -- what it must not do
+    is sit in `gaps()` claiming work that no run will ever pick up. This is why
+    `1 still owed` outlived the failure that caused it on the deployed container.
+    """
+    broken = RefApi(fail={"splits", "dividends"})
+    ctx = make_context(tmp_path, broken)
+    try:
+        failed_day = DAY
+        result = jobs.run_corporate_actions(ctx, today=failed_day)
+        assert result.outcome == "hard_failure"
+        assert [g.day for g in ctx.manifest.gaps("splits")] == [failed_day]
+    finally:
+        ctx.client.close()
+        ctx.manifest.close()
+
+    working = RefApi()
+    ctx = make_context(tmp_path, working)
+    try:
+        jobs.run_corporate_actions(ctx, today=NEXT_DAY)
+
+        for dataset in ("splits", "dividends"):
+            assert ctx.manifest.gaps(dataset) == [], f"{dataset} must no longer be owed"
+            row = ctx.manifest.conn.execute(
+                "SELECT state, last_error FROM coverage WHERE dataset = ? AND day = ?",
+                (dataset, failed_day.isoformat()),
+            ).fetchone()
+            assert row["state"] == manifest_module.SKIPPED
+            assert "superseded" in row["last_error"]
+    finally:
+        ctx.client.close()
+        ctx.manifest.close()
+
+
+def test_a_run_that_fails_too_leaves_the_earlier_failure_on_the_books(tmp_path):
+    """Retirement is a claim that the data was recovered. Only a success can make it."""
+    broken = RefApi(fail={"splits", "dividends"})
+    ctx = make_context(tmp_path, broken)
+    try:
+        jobs.run_corporate_actions(ctx, today=DAY)
+        jobs.run_corporate_actions(ctx, today=NEXT_DAY)
+
+        owed = [g.day for g in ctx.manifest.gaps("splits")]
+        assert DAY in owed
+        assert NEXT_DAY in owed
+    finally:
+        ctx.client.close()
+        ctx.manifest.close()
+
+
+def test_a_day_missed_for_longer_than_the_lookback_is_recorded_as_missed(tmp_path):
+    """A 90-day outage means revisions really were lost; the reason must say so."""
+    broken = RefApi(fail={"splits", "dividends"})
+    ctx = make_context(tmp_path, broken)
+    try:
+        stale_day = date(2026, 1, 5)  # a Monday
+        jobs.run_corporate_actions(ctx, today=stale_day)
+    finally:
+        ctx.client.close()
+        ctx.manifest.close()
+
+    working = RefApi()
+    ctx = make_context(tmp_path, working)
+    try:
+        today = stale_day + timedelta(days=jobs.CORPORATE_ACTION_LOOKBACK_DAYS + 1)
+        jobs.run_corporate_actions(ctx, today=today)
+
+        row = ctx.manifest.conn.execute(
+            "SELECT state, last_error FROM coverage WHERE dataset = 'splits' AND day = ?",
+            (stale_day.isoformat(),),
+        ).fetchone()
+        assert row["state"] == manifest_module.SKIPPED
+        assert "never collected" in row["last_error"]
+        assert ctx.manifest.gaps("splits") == []
+    finally:
+        ctx.client.close()
+        ctx.manifest.close()
+
+
+def test_corporate_actions_on_a_weekend_is_not_a_failure(tmp_path):
+    """The deployed container went unhealthy every Saturday for this.
+
+    The job is scheduled daily and also runs on startup, so a restart at the
+    weekend hit it too. Nothing is lost by skipping: the 90-day lookback picks up
+    anything announced over the weekend on Monday.
+    """
+    saturday = date(2026, 10, 3)
+    ctx = make_context(tmp_path, RefApi())
+    try:
+        assert not ctx.calendar.is_trading_day(saturday)
+        result = jobs.run_corporate_actions(ctx, today=saturday)
+
+        assert result.outcome == "ok"
+        assert result.quarantined == 0
+        for dataset in ("splits", "dividends"):
+            assert ctx.manifest.gaps(dataset) == [], "a skipped day must not be owed"
+            assert ctx.manifest.coverage_summary(dataset) == {}
+    finally:
+        ctx.client.close()
+        ctx.manifest.close()
+
+
+def test_a_weekend_no_op_does_not_retire_an_earlier_failure(tmp_path):
+    """Retirement claims the data was recovered. A run that fetched nothing cannot."""
+    ctx = make_context(tmp_path, RefApi(fail={"splits", "dividends"}))
+    try:
+        jobs.run_corporate_actions(ctx, today=DAY)
+        assert [g.day for g in ctx.manifest.gaps("splits")] == [DAY]
+
+        jobs.run_corporate_actions(ctx, today=date(2026, 10, 3))  # a Saturday
+
+        assert [g.day for g in ctx.manifest.gaps("splits")] == [DAY]
+    finally:
+        ctx.client.close()
+        ctx.manifest.close()
